@@ -2,13 +2,12 @@
 # RLD – 2025 (Versión 1.0)
 # =========================
 # - Contraseñas INICIALES FIJAS para entregar (sin aleatorios)
-# - Migración automática: actualiza password_hash existentes a las claves fijas
-# - Cada usuario puede CAMBIAR su contraseña en "Mi Perfil"
+# - Migración automática de hashes a las claves fijas
+# - Cambio de contraseña por el propio usuario
 # - CRUD por usuario (solo ve/edita/borra lo propio)
-# - Admin (vperaza) ve todo, valida/rechaza, observa, resetea a contraseña fija
-# - Resumen por usuario y logs
-# - Google Sheets vía gspread (Service Account en st.secrets)
-# - Compatibilidad Streamlit 1.30+: _rerun() usa st.rerun() y fallback a experimental_rerun
+# - Panel Admin (validación, observación, reset a clave fija, activar/inactivar, export, resumen)
+# - Google Sheets con Service Account (normalización de private_key)
+# - Compatibilidad Streamlit 1.30+ con _rerun()
 
 import time
 import hashlib
@@ -20,10 +19,10 @@ import pandas as pd
 
 # Google Sheets
 import gspread
+from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 APP_TITLE = "REGISTRO DE LABORES DIARIAS (RLD) – 2025 (Versión 1.0)"
-
 st.set_page_config(page_title="RLD 2025", layout="wide")
 
 # ---------- helper de recarga (compatibilidad) ----------
@@ -33,7 +32,7 @@ def _rerun():
     except AttributeError:
         st.experimental_rerun()
 
-# === URL del Spreadsheet (el que enviaste) ===
+# === URL del Spreadsheet ===
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1diLJ9ZuG1ZvBRICTQll1he3H1pnouikclGle2bKIk6E/edit?usp=sharing"
 
 # ---------- Usuarios iniciales ----------
@@ -63,12 +62,12 @@ PASSWORDS_FIJAS = {
 }
 
 # ---------- Nombres de pestañas en Sheets ----------
-SHEET_USUARIOS  = "Usuarios"
+SHEET_USUARIOS   = "Usuarios"
 SHEET_RESPUESTAS = "RLD_respuestas"
-SHEET_RESUMEN   = "RLD_por_usuario"
-SHEET_LOGS      = "Logs"
+SHEET_RESUMEN    = "RLD_por_usuario"
+SHEET_LOGS       = "Logs"
 
-# ---------- Catálogo (ajústalo si deseas) ----------
+# ---------- Catálogo ----------
 TRABAJOS_CATALOGO = [
     "Patrullaje Preventivo", "Atención de Incidencias", "Charlas Comunitarias",
     "Reunión Interinstitucional", "Operativo Focalizado", "Apoyo a Otras Unidades",
@@ -84,23 +83,56 @@ def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
 
 def password_fija_de(usuario: str) -> str:
-    """Devuelve la contraseña fija definida arriba (texto plano)."""
     return PASSWORDS_FIJAS[usuario.strip().lower()]
 
 # ========= Conexión Google Sheets =========
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     if "gcp_service_account" not in st.secrets:
-        raise RuntimeError("Faltan credenciales en st.secrets['gcp_service_account']")
-    info = st.secrets["gcp_service_account"]
-    creds = Credentials.from_service_account_info(info, scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ])
-    return gspread.authorize(creds)
+        st.error("Faltan credenciales en st.secrets['gcp_service_account'].")
+        st.stop()
+
+    # Copiamos y normalizamos secrets
+    info = dict(st.secrets["gcp_service_account"])
+    # 🔧 Convierte '\n' literales en saltos de línea reales
+    if isinstance(info.get("private_key"), str):
+        info["private_key"] = info["private_key"].replace("\\n", "\n").replace("\r\n", "\n")
+
+    # Guardamos correo del SA para diagnóstico
+    st.session_state["_svc_email"] = info.get("client_email", "desconocido")
+
+    try:
+        creds = Credentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        return gspread.authorize(creds)
+    except Exception:
+        st.error("No se pudieron cargar las credenciales del Service Account.")
+        st.caption("Revisa que el private_key tenga saltos de línea reales y que las APIs de Sheets/Drive estén habilitadas.")
+        st.stop()
 
 def _open_sheet():
-    return get_gspread_client().open_by_url(SPREADSHEET_URL)
+    gc = get_gspread_client()
+    try:
+        return gc.open_by_url(SPREADSHEET_URL)
+    except APIError:
+        # Fallback por KEY
+        try:
+            key = SPREADSHEET_URL.split("/d/")[1].split("/")[0]
+            return gc.open_by_key(key)
+        except Exception:
+            svc = st.session_state.get("_svc_email", "(sin email)")
+            st.error("No se pudo abrir el Spreadsheet por permisos o URL.")
+            st.markdown(
+                f"- Comparte la hoja con **{svc}** como *Editor*.\n"
+                f"- Confirma que la URL/KEY es correcta.\n"
+                f"- Habilita **Google Sheets API** y **Google Drive API** en el proyecto del Service Account."
+            )
+            st.stop()
 
 def _ensure_ws(sh, title: str, header: List[str]):
     try:
@@ -172,24 +204,20 @@ def seed_usuarios_si_vacio() -> bool:
         return False
 
     for (id_, nombre, usuario, rol) in USUARIOS_INICIALES:
-        pwd_fija = password_fija_de(usuario)  # texto plano
+        pwd_fija = password_fija_de(usuario)
         ws.append_row([id_, nombre, usuario, rol, hash_password(pwd_fija), True, iso_now(), ""])
 
     write_log("seed_usuarios", "sistema", f"Sembró {len(USUARIOS_INICIALES)} usuarios con contraseñas fijas")
     return True
 
 def migrate_passwords_a_fijas() -> int:
-    """
-    Actualiza los password_hash de la hoja Usuarios a las contraseñas FIJAS
-    definidas en PASSWORDS_FIJAS. Devuelve la cantidad de usuarios actualizados.
-    """
+    """Actualiza los password_hash existentes a las contraseñas fijas."""
     ws = _ws_usuarios()
     recs = ws.get_all_records()
     if not recs:
         return 0
-
     actualizados = 0
-    for i, r in enumerate(recs, start=2):  # datos comienzan en la fila 2
+    for i, r in enumerate(recs, start=2):  # fila 2 = primera de datos
         usuario = str(r.get("usuario", "")).strip().lower()
         if usuario in PASSWORDS_FIJAS:
             hash_actual = str(r.get("password_hash", ""))
@@ -545,9 +573,9 @@ def guardar_observacion_admin(uid: str, texto: str, usuario_ctx: Dict):
         st.error("No se encontró el registro.")
         return
     r = cell.row
-    ws.update_cell(r, 11, texto)          # observacion_admin
-    ws.update_cell(r, 14, iso_now())      # editado_en
-    ws.update_cell(r, 16, usuario_ctx["usuario"])  # editado_por
+    ws.update_cell(r, 11, texto)
+    ws.update_cell(r, 14, iso_now())
+    ws.update_cell(r, 16, usuario_ctx["usuario"])
     write_log("obs_admin", usuario_ctx["usuario"], f"{uid}")
     st.success("Observación guardada.")
 
@@ -560,7 +588,7 @@ def reset_password_fija(usuario_id: str, usuario_ctx: Dict):
     r = cell.row
     usuario = ws.cell(r, 3).value  # username
     pwd = password_fija_de(usuario)
-    ws.update_cell(r, 5, hash_password(pwd))  # password_hash
+    ws.update_cell(r, 5, hash_password(pwd))
     write_log("reset_password_fija", usuario_ctx["usuario"], f"Reseteó {usuario} a su clave fija")
     st.success(f"Contraseña reiniciada a la fija de {usuario}: **{pwd}**")
 
@@ -619,8 +647,19 @@ def view_perfil(usuario_ctx: Dict):
 
 # ========= Main =========
 def main():
-    seeded = seed_usuarios_si_vacio()           # crea usuarios con contraseñas FIJAS si hoja está vacía
-    migrados = migrate_passwords_a_fijas()      # fuerza que los existentes usen las contraseñas fijas
+    # Diagnóstico rápido (opcional: puedes ocultarlo si gustas)
+    with st.expander("🔎 Diagnóstico de Google Sheets"):
+        st.write("Service Account:", st.session_state.get("_svc_email", "desconocido"))
+        try:
+            sh = _open_sheet()
+            st.success(f"OK: {sh.title}")
+            st.write("Pestañas:", [w.title for w in sh.worksheets()])
+        except Exception as e:
+            st.exception(e)
+            st.stop()
+
+    seeded = seed_usuarios_si_vacio()
+    migrados = migrate_passwords_a_fijas()
     if seeded or migrados:
         with st.expander("✅ Credenciales iniciales/fijas"):
             st.write(pd.DataFrame(
