@@ -1,14 +1,6 @@
 # =========================
 # RLD – 2025 (Versión 1.0)
 # =========================
-# - Contraseñas INICIALES FIJAS para entregar (sin aleatorios)
-# - Migración automática: actualiza password_hash existentes a las claves fijas
-# - Cada usuario puede CAMBIAR su contraseña en "Mi Perfil"
-# - CRUD por usuario (solo ve/edita/borra lo propio)
-# - Admin (vperaza) ve todo, valida/rechaza, observa, resetea a contraseña fija
-# - Resumen por usuario y logs
-# - Google Sheets vía gspread (Service Account; normaliza private_key)
-# - Compatibilidad Streamlit 1.30+ (_rerun usa st.rerun con fallback)
 
 import time
 import hashlib
@@ -97,7 +89,6 @@ def get_gspread_client():
     if isinstance(info.get("private_key"), str):
         info["private_key"] = info["private_key"].replace("\\n", "\n").replace("\r\n", "\n")
 
-    # Guardamos el email para referencia si se requiere
     st.session_state["_svc_email"] = info.get("client_email", "desconocido")
 
     try:
@@ -118,14 +109,12 @@ def get_spreadsheet():
     """Abre el spreadsheet una sola vez y lo cachea. Usa KEY del URL (más robusto)."""
     gc = get_gspread_client()
     key = SPREADSHEET_URL.split("/d/")[1].split("/")[0]
-    # 1) por KEY
     try:
-        return gc.open_by_key(key)
+        return gc.open_by_key(key)  # preferido
     except APIError:
         pass
-    # 2) fallback por URL
     try:
-        return gc.open_by_url(SPREADSHEET_URL)
+        return gc.open_by_url(SPREADSHEET_URL)  # fallback
     except Exception:
         svc = st.session_state.get("_svc_email", "(sin email)")
         st.error("No se pudo abrir el Spreadsheet.")
@@ -199,33 +188,29 @@ def write_log(evento: str, quien: str, detalle: str):
 
 # ========= Seed y Migración =========
 def seed_usuarios_si_vacio() -> bool:
-    """Si no hay usuarios en la hoja, crea los usuarios con las CONTRASEÑAS FIJAS (hasheadas)."""
     ws = _ws_usuarios()
     recs = ws.get_all_records()
     if recs:
         return False
-
     for (id_, nombre, usuario, rol) in USUARIOS_INICIALES:
         pwd_fija = password_fija_de(usuario)
         ws.append_row([id_, nombre, usuario, rol, hash_password(pwd_fija), True, iso_now(), ""])
-
     write_log("seed_usuarios", "sistema", f"Sembró {len(USUARIOS_INICIALES)} usuarios con contraseñas fijas")
     return True
 
 def migrate_passwords_a_fijas() -> int:
-    """Actualiza los password_hash existentes a las contraseñas fijas."""
     ws = _ws_usuarios()
     recs = ws.get_all_records()
     if not recs:
         return 0
     actualizados = 0
-    for i, r in enumerate(recs, start=2):  # fila 2 = primera de datos
+    for i, r in enumerate(recs, start=2):
         usuario = str(r.get("usuario", "")).strip().lower()
         if usuario in PASSWORDS_FIJAS:
             hash_actual = str(r.get("password_hash", ""))
             hash_fijo = hash_password(PASSWORDS_FIJAS[usuario])
             if hash_actual != hash_fijo:
-                ws.update_cell(i, 5, hash_fijo)  # col 5 = password_hash
+                ws.update_cell(i, 5, hash_fijo)
                 actualizados += 1
     if actualizados:
         write_log("migracion_passwords", "sistema", f"Actualizó {actualizados} usuarios a contraseñas fijas")
@@ -238,25 +223,50 @@ def set_ultimo_acceso(usuario_id: str):
         ws.update_cell(cell.row, 8, iso_now())
 
 def actualizar_resumen():
+    """
+    Recalcula el resumen por usuario asegurando que TODO sea serializable:
+    - enteros nativos (int) en totales/contadores
+    - strings en ids/nombres/fechas
+    """
     ws = _ws_resumen()
     df_u = df_usuarios()
     df_r = df_respuestas()
+
     ws.clear()
     ws.append_row(["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
     if df_u.empty:
         return
+
     rows = []
     for _, u in df_u.iterrows():
-        uid = str(u["id"]); uname = u["nombre"]
-        sub = df_r[df_r["usuario_id"].astype(str) == uid]
-        total = len(sub)
-        pend = (sub["estado_validacion"] == "Pendiente").sum() if not sub.empty else 0
-        vali = (sub["estado_validacion"] == "Validada").sum() if not sub.empty else 0
-        rech = (sub["estado_validacion"] == "Rechazada").sum() if not sub.empty else 0
-        ultima = str(sub["creado_en"].max()) if not sub.empty and sub["creado_en"].notna().any() else ""
+        uid = str(u.get("id", ""))
+        uname = str(u.get("nombre", ""))
+
+        sub = df_r[df_r.get("usuario_id", "").astype(str) == uid] if not df_r.empty else pd.DataFrame()
+
+        total = int(len(sub))
+        pend = int((sub["estado_validacion"] == "Pendiente").sum()) if not sub.empty else 0
+        vali = int((sub["estado_validacion"] == "Validada").sum())  if not sub.empty else 0
+        rech = int((sub["estado_validacion"] == "Rechazada").sum()) if not sub.empty else 0
+
+        if not sub.empty and sub["creado_en"].notna().any():
+            try:
+                ultima_val = pd.to_datetime(sub["creado_en"], errors="coerce").max()
+                ultima = "" if pd.isna(ultima_val) else str(ultima_val)
+            except Exception:
+                ultima = ""
+        else:
+            ultima = ""
+
         rows.append([uid, uname, total, pend, vali, rech, ultima])
+
     if rows:
-        ws.append_rows(rows)
+        # Garantiza tipos nativos antes de enviar a Sheets
+        safe_rows = [
+            [str(r[0]), str(r[1]), int(r[2]), int(r[3]), int(r[4]), int(r[5]), str(r[6])]
+            for r in rows
+        ]
+        ws.append_rows(safe_rows)
 
 # ========= Autenticación =========
 def do_login():
@@ -561,9 +571,9 @@ def cambiar_estado(uid: str, nuevo_estado: str, usuario_ctx: Dict):
         st.error("No se encontró el registro.")
         return
     r = cell.row
-    ws.update_cell(r, 10, nuevo_estado)  # estado_validacion
-    ws.update_cell(r, 14, iso_now())      # editado_en
-    ws.update_cell(r, 16, usuario_ctx["usuario"])  # editado_por
+    ws.update_cell(r, 10, nuevo_estado)
+    ws.update_cell(r, 14, iso_now())
+    ws.update_cell(r, 16, usuario_ctx["usuario"])
     write_log("validacion", usuario_ctx["usuario"], f"{nuevo_estado} {uid}")
     actualizar_resumen()
     st.success(f"Estado actualizado a {nuevo_estado}.")
@@ -588,7 +598,7 @@ def reset_password_fija(usuario_id: str, usuario_ctx: Dict):
         st.error("No se encontró el ID.")
         return
     r = cell.row
-    usuario = ws.cell(r, 3).value  # username
+    usuario = ws.cell(r, 3).value
     pwd = password_fija_de(usuario)
     ws.update_cell(r, 5, hash_password(pwd))
     write_log("reset_password_fija", usuario_ctx["usuario"], f"Reseteó {usuario} a su clave fija")
@@ -607,7 +617,7 @@ def toggle_activo(usuario_id: str, usuario_ctx: Dict):
     write_log("toggle_activo", usuario_ctx["usuario"], f"ID {usuario_id} -> {nuevo}")
     st.success("Estado actualizado.")
 
-# ========= Mi Perfil (cambio de contraseña) =========
+# ========= Mi Perfil =========
 def view_perfil(usuario_ctx: Dict):
     st.subheader("Mi Perfil")
     st.write(f"**Nombre:** {usuario_ctx['nombre']}  |  **Usuario:** `{usuario_ctx['usuario']}`  |  **Rol:** `{usuario_ctx['rol']}`")
@@ -649,8 +659,8 @@ def view_perfil(usuario_ctx: Dict):
 
 # ========= Main =========
 def main():
-    seed_usuarios_si_vacio()          # crea usuarios (si fuera necesario)
-    migrados = migrate_passwords_a_fijas()  # fuerza contraseñas fijas si no coinciden
+    seed_usuarios_si_vacio()
+    migrados = migrate_passwords_a_fijas()
     if migrados:
         st.toast(f"Actualizados {migrados} usuarios a contraseñas fijas.", icon="✅")
 
@@ -684,8 +694,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 
