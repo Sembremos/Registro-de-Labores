@@ -8,6 +8,7 @@
 # - Admin (vperaza) ve todo, valida/rechaza, observa, resetea a contraseña fija
 # - Resumen por usuario y logs
 # - Google Sheets vía gspread (Service Account en st.secrets)
+# - Compatibilidad Streamlit 1.30+: _rerun() usa st.rerun() y fallback a experimental_rerun
 
 import time
 import hashlib
@@ -24,6 +25,13 @@ from google.oauth2.service_account import Credentials
 APP_TITLE = "REGISTRO DE LABORES DIARIAS (RLD) – 2025 (Versión 1.0)"
 
 st.set_page_config(page_title="RLD 2025", layout="wide")
+
+# ---------- helper de recarga (compatibilidad) ----------
+def _rerun():
+    try:
+        st.rerun()
+    except AttributeError:
+        st.experimental_rerun()
 
 # === URL del Spreadsheet (el que enviaste) ===
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1diLJ9ZuG1ZvBRICTQll1he3H1pnouikclGle2bKIk6E/edit?usp=sharing"
@@ -253,14 +261,14 @@ def do_login():
         }
         set_ultimo_acceso(str(row["id"]))
         write_log("login", row["usuario"], "Inicio de sesión")
-        st.experimental_rerun()
+        _rerun()
 
 def logout_btn():
     with st.sidebar:
         st.caption(f"Conectado como **{st.session_state['auth']['nombre']}** ({st.session_state['auth']['rol']})")
         if st.button("Cerrar sesión", use_container_width=True):
             st.session_state.pop("auth", None)
-            st.experimental_rerun()
+            _rerun()
 
 # ========= UI comunes =========
 def view_portada():
@@ -307,7 +315,7 @@ def form_registro(usuario_ctx: Dict):
         write_log("crear", usuario_ctx["usuario"], f"Nuevo rld {uid}")
         actualizar_resumen()
         st.success("Registro guardado.")
-        st.experimental_rerun()
+        _rerun()
 
 def table_mis_labores(usuario_ctx: Dict):
     st.subheader("Mis Labores")
@@ -403,7 +411,7 @@ def editar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
         write_log("editar", usuario_ctx["usuario"], f"Editó {uid}")
         actualizar_resumen()
         st.success("Cambios guardados.")
-        st.experimental_rerun()
+        _rerun()
 
 def eliminar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
     dfr = df_respuestas()
@@ -426,7 +434,7 @@ def eliminar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
         write_log("eliminar", usuario_ctx["usuario"], f"Eliminó {uid}")
         actualizar_resumen()
         st.success("Registro eliminado.")
-        st.experimental_rerun()
+        _rerun()
     else:
         st.error("No se encontró la fila en la hoja.")
 
@@ -607,7 +615,7 @@ def view_perfil(usuario_ctx: Dict):
         st.success("Contraseña actualizada correctamente. Vuelva a iniciar sesión.")
         if st.button("Cerrar sesión ahora"):
             st.session_state.pop("auth", None)
-            st.experimental_rerun()
+            _rerun()
 
 # ========= Main =========
 def main():
@@ -652,6 +660,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
