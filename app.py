@@ -2,6 +2,7 @@
 # RLD – 2025 (Versión 1.0)
 # =========================
 # - Contraseñas INICIALES FIJAS para entregar (sin aleatorios)
+# - Migración automática: actualiza password_hash existentes a las claves fijas
 # - Cada usuario puede CAMBIAR su contraseña en "Mi Perfil"
 # - CRUD por usuario (solo ve/edita/borra lo propio)
 # - Admin (vperaza) ve todo, valida/rechaza, observa, resetea a contraseña fija
@@ -154,7 +155,8 @@ def df_respuestas() -> pd.DataFrame:
 def write_log(evento: str, quien: str, detalle: str):
     _ws_logs().append_row([evento, quien, detalle, iso_now()])
 
-def seed_usuarios_si_vacio():
+# ========= Seed y Migración =========
+def seed_usuarios_si_vacio() -> bool:
     """Si no hay usuarios en la hoja, crea los usuarios con las CONTRASEÑAS FIJAS (hasheadas)."""
     ws = _ws_usuarios()
     recs = ws.get_all_records()
@@ -167,6 +169,29 @@ def seed_usuarios_si_vacio():
 
     write_log("seed_usuarios", "sistema", f"Sembró {len(USUARIOS_INICIALES)} usuarios con contraseñas fijas")
     return True
+
+def migrate_passwords_a_fijas() -> int:
+    """
+    Actualiza los password_hash de la hoja Usuarios a las contraseñas FIJAS
+    definidas en PASSWORDS_FIJAS. Devuelve la cantidad de usuarios actualizados.
+    """
+    ws = _ws_usuarios()
+    recs = ws.get_all_records()
+    if not recs:
+        return 0
+
+    actualizados = 0
+    for i, r in enumerate(recs, start=2):  # datos comienzan en la fila 2
+        usuario = str(r.get("usuario", "")).strip().lower()
+        if usuario in PASSWORDS_FIJAS:
+            hash_actual = str(r.get("password_hash", ""))
+            hash_fijo = hash_password(PASSWORDS_FIJAS[usuario])
+            if hash_actual != hash_fijo:
+                ws.update_cell(i, 5, hash_fijo)  # col 5 = password_hash
+                actualizados += 1
+    if actualizados:
+        write_log("migracion_passwords", "sistema", f"Actualizó {actualizados} usuarios a contraseñas fijas")
+    return actualizados
 
 def set_ultimo_acceso(usuario_id: str):
     ws = _ws_usuarios()
@@ -586,13 +611,16 @@ def view_perfil(usuario_ctx: Dict):
 
 # ========= Main =========
 def main():
-    seeded = seed_usuarios_si_vacio()  # crea usuarios con contraseñas FIJAS si hoja está vacía
-    if seeded:
-        with st.expander("✅ Usuarios creados con contraseñas fijas (solo referencia)"):
+    seeded = seed_usuarios_si_vacio()           # crea usuarios con contraseñas FIJAS si hoja está vacía
+    migrados = migrate_passwords_a_fijas()      # fuerza que los existentes usen las contraseñas fijas
+    if seeded or migrados:
+        with st.expander("✅ Credenciales iniciales/fijas"):
             st.write(pd.DataFrame(
                 [{"nombre": n, "usuario": u, "password_inicial": PASSWORDS_FIJAS[u], "rol": r}
                  for _, n, u, r in USUARIOS_INICIALES]
             ))
+            if migrados:
+                st.success(f"Se actualizaron {migrados} usuarios a las contraseñas fijas.")
 
     view_portada()
 
@@ -624,6 +652,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
