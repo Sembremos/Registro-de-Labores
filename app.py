@@ -6,16 +6,15 @@
 # - CRUD de RLD por usuario (cada quien solo ve/edita/borra lo suyo)
 # - Admin (Sargento Viviana Peraza) ve todo, valida/rechaza, deja observación
 # - Resumen por usuario y logs de auditoría
+# - Cambio de contraseña por el propio usuario
 # - Google Sheets vía gspread (Service Account en st.secrets)
 # - Zona horaria America/Costa_Rica
 
-import os
 import time
-import json
 import hashlib
 import random
-from datetime import datetime, date, time as dtime
-from typing import List, Dict, Optional
+from datetime import datetime, date
+from typing import List, Dict
 
 import streamlit as st
 import pandas as pd
@@ -43,7 +42,7 @@ SHEET_RESPUESTAS = "RLD_respuestas"
 SHEET_RESUMEN = "RLD_por_usuario"
 SHEET_LOGS = "Logs"
 
-# Selects (puedes ajustar luego desde Admin si deseas)
+# Selects
 TRABAJOS_CATALOGO = [
     "Patrullaje Preventivo", "Atención de Incidencias", "Charlas Comunitarias",
     "Reunión Interinstitucional", "Operativo Focalizado", "Apoyo a Otras Unidades",
@@ -52,8 +51,6 @@ TRABAJOS_CATALOGO = [
 
 # ========= Helpers de tiempo =========
 def now_cr() -> datetime:
-    # Guardaremos siempre timestamp ISO local legible
-    # (Google Sheets no maneja TZ; registramos string)
     return datetime.now()
 
 def iso_now() -> str:
@@ -63,12 +60,13 @@ def iso_now() -> str:
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
 
-def generar_password(nombre: str, pool: List[str]) -> str:
-    # Ej: "jeremy-Jannia-Esteban"
-    otros = [n for n in pool if n.lower() != nombre.lower()]
-    pick = random.sample(otros, 2) if len(otros) >= 2 else otros
-    base = nombre.strip().lower()
-    return f"{base}-{ '-'.join(pick) }" if pick else base
+def generar_password(nombre: str) -> str:
+    """
+    Devuelve: nombre en minúsculas (primer token) + 2 dígitos aleatorios.
+    Ej.: 'Jeremy' -> 'jeremy83', 'Viviana Peraza' -> 'viviana57'
+    """
+    base = nombre.strip().split()[0].lower()
+    return f"{base}{random.randint(10, 99)}"
 
 # ========= Conexión Google Sheets =========
 @st.cache_resource(show_spinner=False)
@@ -93,7 +91,6 @@ def _ensure_ws(sh, title: str, header: List[str]):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=1000, cols=max(len(header), 10))
         ws.append_row(header)
-    # Si la hoja existe pero sin encabezado
     vals = ws.get_all_values()
     if not vals:
         ws.append_row(header)
@@ -150,28 +147,26 @@ def write_log(evento: str, quien: str, detalle: str):
     ws = _ws_logs()
     ws.append_row([evento, quien, detalle, iso_now()])
 
-def seed_usuarios_si_vacio() -> List[Dict]:
+def seed_usuarios_si_vacio():
     """Si Usuarios está vacío, crea usuarios iniciales + admin.
-       Devuelve credenciales en texto plano SOLO esta ejecución (para mostrarlas una vez)."""
+       Devuelve credenciales en texto plano SOLO esta ejecución (para mostrar una vez)."""
     ws = _ws_usuarios()
     recs = ws.get_all_records()
     if recs:
         return []
 
-    # Generar IDs y usuarios
-    todos = USUARIOS_INICIALES[:] + [ADMIN_NOMBRE]
     credenciales_mostrables = []
     next_id = 1
     for nombre in USUARIOS_INICIALES:
         usuario = nombre.strip().split()[0].lower()
-        pwd = generar_password(nombre, USUARIOS_INICIALES)
+        pwd = generar_password(nombre)
         ws.append_row([f"{next_id:03d}", nombre, usuario, "user", hash_password(pwd), True, iso_now(), ""])
         credenciales_mostrables.append({"nombre": nombre, "usuario": usuario, "password": pwd, "rol": "user"})
         next_id += 1
 
     # Admin
     usuario_admin = "vperaza"
-    pwd_admin = generar_password("Viviana", USUARIOS_INICIALES + ["Viviana"])
+    pwd_admin = generar_password("Viviana")
     ws.append_row([f"{next_id:03d}", ADMIN_NOMBRE, usuario_admin, "admin",
                    hash_password(pwd_admin), True, iso_now(), ""])
     credenciales_mostrables.append({"nombre": ADMIN_NOMBRE, "usuario": usuario_admin, "password": pwd_admin, "rol": "admin"})
@@ -184,17 +179,17 @@ def set_ultimo_acceso(usuario_id: str):
     cell = ws.find(usuario_id)
     if cell:
         row = cell.row
-        # columnas: id, nombre, usuario, rol, password_hash, activo, creado_en, ultimo_acceso
-        ws.update_cell(row, 8, iso_now())  # col 8 = ultimo_acceso
+        ws.update_cell(row, 8, iso_now())
 
 def actualizar_resumen():
     ws = _ws_resumen()
     df_u = df_usuarios()
     df_r = df_respuestas()
 
+    ws.clear()
+    ws.append_row(["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
+
     if df_u.empty:
-        ws.clear()
-        ws.append_row(["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
         return
 
     rows = []
@@ -211,8 +206,6 @@ def actualizar_resumen():
             ultima = str(sub["creado_en"].max())
         rows.append([uid, uname, total, pend, vali, rech, ultima])
 
-    ws.clear()
-    ws.append_row(["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
     if rows:
         ws.append_rows(rows)
 
@@ -241,7 +234,6 @@ def do_login():
             st.error("Contraseña incorrecta.")
             return
 
-        # OK
         st.session_state["auth"] = {
             "id": str(row["id"]),
             "nombre": row["nombre"],
@@ -259,7 +251,7 @@ def logout_btn():
             st.session_state.pop("auth", None)
             st.experimental_rerun()
 
-# ========= Vistas =========
+# ========= Vistas comunes =========
 def view_portada():
     st.title(APP_TITLE)
     st.info(
@@ -281,7 +273,8 @@ def form_registro(usuario_ctx: Dict):
 
     trabajo = st.selectbox("Trabajo Realizado", TRABAJOS_CATALOGO)
     localidad = st.text_input("Localidad / Delegación")
-    # Funcionario Responsable = catálogo de usuarios activos (user)
+
+    # Funcionario Responsable = usuarios activos (rol=user)
     dfu = df_usuarios()
     opciones_func = dfu[(dfu["rol"]=="user") & (dfu["activo"]==True)]["nombre"].tolist()
     func_resp = st.selectbox("Funcionario Responsable", opciones_func or [usuario_ctx["nombre"]])
@@ -329,7 +322,7 @@ def table_mis_labores(usuario_ctx: Dict):
             mine = mine[mine["fecha_dt"] <= pd.to_datetime(f_fin)]
         if estado != "(Todos)":
             mine = mine[mine["estado_validacion"] == estado]
-        mine = mine.drop(columns=["fecha_dt"])
+        mine = mine.drop(columns=["fecha_dt"], errors="ignore")
 
     st.dataframe(mine, use_container_width=True, hide_index=True)
 
@@ -341,7 +334,7 @@ def table_mis_labores(usuario_ctx: Dict):
             editar_fila(uid, usuario_ctx, es_admin=False)
     with c2:
         if st.button("Eliminar seleccionado", use_container_width=True, disabled=mine.empty or uid.strip()==""):
-            eliminar_fila(uid, usuario_ctx, es_admin=False)
+            confirmar_eliminar(uid, usuario_ctx, es_admin=False)
 
 def editar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
     dfr = df_respuestas()
@@ -370,15 +363,16 @@ def editar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
             h = datetime.now().time()
         f_hora = st.time_input("Hora", value=h)
 
-    trabajo = st.selectbox("Trabajo Realizado", TRABAJOS_CATALOGO, index=max(0, TRABAJOS_CATALOGO.index(row["trabajo_realizado"])) if row["trabajo_realizado"] in TRABAJOS_CATALOGO else 0)
+    trabajo = st.selectbox(
+        "Trabajo Realizado",
+        TRABAJOS_CATALOGO,
+        index=max(0, TRABAJOS_CATALOGO.index(row["trabajo_realizado"])) if row["trabajo_realizado"] in TRABAJOS_CATALOGO else 0
+    )
     localidad = st.text_input("Localidad / Delegación", value=str(row["localidad_delegacion"]))
 
     dfu = df_usuarios()
     opciones_func = dfu[(dfu["rol"]=="user") & (dfu["activo"]==True)]["nombre"].tolist()
-    try:
-        idx = opciones_func.index(row["funcionario_responsable"]) if row["funcionario_responsable"] in opciones_func else 0
-    except Exception:
-        idx = 0
+    idx = opciones_func.index(row["funcionario_responsable"]) if row["funcionario_responsable"] in opciones_func and opciones_func else 0
     func_resp = st.selectbox("Funcionario Responsable", opciones_func or [usuario_ctx["nombre"]], index=idx)
 
     obs = st.text_area("Observaciones", value=str(row["observaciones"]), help="Detalle las actividades realizadas **por guardia** e indique si alguna quedó pendiente.")
@@ -402,6 +396,16 @@ def editar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
         st.success("Cambios guardados.")
         st.experimental_rerun()
 
+def confirmar_eliminar(uid: str, usuario_ctx: Dict, es_admin: bool):
+    with st.modal("Confirmar eliminación"):
+        st.warning("Esta acción no se puede deshacer.")
+        ok = st.button("Eliminar definitivamente", type="primary")
+        cancel = st.button("Cancelar")
+        if ok:
+            eliminar_fila(uid, usuario_ctx, es_admin)
+        elif cancel:
+            st.stop()
+
 def eliminar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
     dfr = df_respuestas()
     row = dfr[dfr["uuid"] == uid]
@@ -416,17 +420,16 @@ def eliminar_fila(uid: str, usuario_ctx: Dict, es_admin: bool):
         st.warning("No puede eliminar registros ya validados/rechazados. Contacte a admin.")
         return
 
-    if st.confirm("¿Eliminar definitivamente este registro?"):
-        ws = _ws_respuestas()
-        cell = ws.find(uid)
-        if cell:
-            ws.delete_rows(cell.row)
-            write_log("eliminar", usuario_ctx["usuario"], f"Eliminó {uid}")
-            actualizar_resumen()
-            st.success("Registro eliminado.")
-            st.experimental_rerun()
-        else:
-            st.error("No se encontró la fila en la hoja.")
+    ws = _ws_respuestas()
+    cell = ws.find(uid)
+    if cell:
+        ws.delete_rows(cell.row)
+        write_log("eliminar", usuario_ctx["usuario"], f"Eliminó {uid}")
+        actualizar_resumen()
+        st.success("Registro eliminado.")
+        st.experimental_rerun()
+    else:
+        st.error("No se encontró la fila en la hoja.")
 
 # -------- Admin --------
 def view_admin(usuario_ctx: Dict):
@@ -437,7 +440,6 @@ def view_admin(usuario_ctx: Dict):
         dfr = df_respuestas()
         # Filtros
         dfu = df_usuarios()
-        usuarios_map = dict(zip(dfu["id"].astype(str), dfu["nombre"]))
         colf1, colf2, colf3 = st.columns([1,1,1])
         with colf1:
             usr = st.selectbox("Usuario", ["(Todos)"] + dfu["nombre"].tolist())
@@ -452,12 +454,19 @@ def view_admin(usuario_ctx: Dict):
         if estado != "(Todos)":
             data = data[data["estado_validacion"] == estado]
         if rango:
-            if isinstance(rango, tuple) or isinstance(rango, list):
-                if len(rango) == 2 and rango[0] and rango[1]:
-                    ini, fin = pd.to_datetime(rango[0]), pd.to_datetime(rango[1])
+            try:
+                ini, fin = rango
+                ini = pd.to_datetime(ini) if ini else None
+                fin = pd.to_datetime(fin) if fin else None
+                if ini is not None:
                     data["fecha_dt"] = pd.to_datetime(data["fecha"], errors="coerce")
-                    data = data[(data["fecha_dt"] >= ini) & (data["fecha_dt"] <= fin)]
-                    data = data.drop(columns=["fecha_dt"], errors="ignore")
+                    data = data[data["fecha_dt"] >= ini]
+                if fin is not None:
+                    data["fecha_dt"] = pd.to_datetime(data["fecha"], errors="coerce")
+                    data = data[data["fecha_dt"] <= fin]
+                data = data.drop(columns=["fecha_dt"], errors="ignore")
+            except Exception:
+                pass
 
         st.dataframe(data, use_container_width=True, hide_index=True)
 
@@ -475,22 +484,24 @@ def view_admin(usuario_ctx: Dict):
                 editar_fila(uid, usuario_ctx, es_admin=True)
         with c4:
             if st.button("Eliminar", use_container_width=True, disabled=uid.strip()==""):
-                eliminar_fila(uid, usuario_ctx, es_admin=True)
+                confirmar_eliminar(uid, usuario_ctx, es_admin=True)
 
         obs_admin = st.text_area("Observación administrativa")
         if st.button("Guardar observación en la fila", disabled=uid.strip()==""):
             guardar_observacion_admin(uid, obs_admin, usuario_ctx)
 
-        # Export
-        if st.download_button("Exportar CSV", data.to_csv(index=False).encode("utf-8"), file_name="rld_2025_export.csv"):
-            pass
+        st.download_button(
+            "Exportar CSV",
+            data.to_csv(index=False).encode("utf-8"),
+            file_name="rld_2025_export.csv"
+        )
 
     # ---- Usuarios ----
     with tabs[1]:
         dfu = df_usuarios()
         st.subheader("Usuarios")
         st.dataframe(dfu, use_container_width=True, hide_index=True)
-        st.caption("Para reiniciar la contraseña de un usuario, ingrese el ID:")
+        st.caption("Para acciones rápidas, ingrese el ID:")
         uid = st.text_input("ID de usuario")
         c1, c2 = st.columns(2)
         with c1:
@@ -517,7 +528,6 @@ def cambiar_estado(uid: str, nuevo_estado: str, usuario_ctx: Dict):
         st.error("No se encontró el registro.")
         return
     r = cell.row
-    # estado_validacion = col 10
     ws.update_cell(r, 10, nuevo_estado)
     ws.update_cell(r, 14, iso_now())  # editado_en
     ws.update_cell(r, 16, usuario_ctx["usuario"])  # editado_por
@@ -532,7 +542,6 @@ def guardar_observacion_admin(uid: str, texto: str, usuario_ctx: Dict):
         st.error("No se encontró el registro.")
         return
     r = cell.row
-    # observacion_admin = col 11
     ws.update_cell(r, 11, texto)
     ws.update_cell(r, 14, iso_now())  # editado_en
     ws.update_cell(r, 16, usuario_ctx["usuario"])  # editado_por
@@ -548,12 +557,10 @@ def reset_password(usuario_id: str, usuario_ctx: Dict):
     r = cell.row
     nombre = ws.cell(r, 2).value
     usuario = ws.cell(r, 3).value
-    rol = ws.cell(r, 4).value
-    pool = USUARIOS_INICIALES[:] + (["Viviana"] if rol == "admin" else [])
-    pwd = generar_password(nombre, pool)
+    pwd = generar_password(nombre)
     ws.update_cell(r, 5, hash_password(pwd))  # password_hash
     write_log("reset_password", usuario_ctx["usuario"], f"Reseteó {usuario}")
-    st.success(f"Nueva contraseña temporal para {usuario}: **{pwd}** (muéstrala al usuario y cámbienla si desean)")
+    st.success(f"Nueva contraseña temporal para {usuario}: **{pwd}**")
 
 def toggle_activo(usuario_id: str, usuario_ctx: Dict):
     ws = _ws_usuarios()
@@ -567,6 +574,48 @@ def toggle_activo(usuario_id: str, usuario_ctx: Dict):
     ws.update_cell(r, 6, nuevo)
     write_log("toggle_activo", usuario_ctx["usuario"], f"ID {usuario_id} -> {nuevo}")
     st.success("Estado actualizado.")
+
+# ========= Mi Perfil (cambio de contraseña) =========
+def view_perfil(usuario_ctx: Dict):
+    st.subheader("Mi Perfil")
+    st.write(f"**Nombre:** {usuario_ctx['nombre']}  |  **Usuario:** `{usuario_ctx['usuario']}`  |  **Rol:** `{usuario_ctx['rol']}`")
+
+    st.markdown("### Cambiar mi contraseña")
+    pwd_actual = st.text_input("Contraseña actual", type="password")
+    pwd_nueva = st.text_input("Nueva contraseña", type="password", help="Mínimo 6 caracteres.")
+    pwd_conf  = st.text_input("Confirmar nueva contraseña", type="password")
+
+    if st.button("Actualizar contraseña", type="primary"):
+        if len(pwd_nueva) < 6:
+            st.error("La nueva contraseña debe tener al menos 6 caracteres.")
+            return
+        if pwd_nueva != pwd_conf:
+            st.error("La confirmación no coincide.")
+            return
+
+        dfu = df_usuarios()
+        row = dfu[dfu["usuario"].astype(str) == usuario_ctx["usuario"]]
+        if row.empty:
+            st.error("No se encontró el usuario.")
+            return
+        row = row.iloc[0]
+        if hash_password(pwd_actual) != row["password_hash"]:
+            st.error("La contraseña actual es incorrecta.")
+            return
+
+        # Actualiza en Sheets
+        ws = _ws_usuarios()
+        cell = ws.find(str(row["id"]))  # buscamos por ID
+        if not cell:
+            st.error("No se pudo ubicar el registro del usuario en la hoja.")
+            return
+        r = cell.row
+        ws.update_cell(r, 5, hash_password(pwd_nueva))
+        write_log("cambio_password", usuario_ctx["usuario"], "Actualizó su contraseña")
+        st.success("Contraseña actualizada correctamente. Vuelva a iniciar sesión.")
+        if st.button("Cerrar sesión ahora"):
+            st.session_state.pop("auth", None)
+            st.experimental_rerun()
 
 # ========= Main =========
 def main():
@@ -584,22 +633,27 @@ def main():
 
     logout_btn()
     user = st.session_state["auth"]
+
     if user["rol"] == "admin":
-        # Menú admin y usuario
-        vista = st.sidebar.radio("Secciones", ["Registrar Labor", "Mis Labores", "Administración"])
+        vista = st.sidebar.radio("Secciones", ["Registrar Labor", "Mis Labores", "Administración", "Mi Perfil"])
+        if vista == "Registrar Labor":
+            form_registro(user)
+        elif vista == "Mis Labores":
+            table_mis_labores(user)
+        elif vista == "Administración":
+            view_admin(user)
+        else:
+            view_perfil(user)
+    else:
+        vista = st.sidebar.radio("Secciones", ["Registrar Labor", "Mis Labores", "Mi Perfil"])
         if vista == "Registrar Labor":
             form_registro(user)
         elif vista == "Mis Labores":
             table_mis_labores(user)
         else:
-            view_admin(user)
-    else:
-        # Solo vistas de usuario
-        vista = st.sidebar.radio("Secciones", ["Registrar Labor", "Mis Labores"])
-        if vista == "Registrar Labor":
-            form_registro(user)
-        else:
-            table_mis_labores(user)
+            view_perfil(user)
 
 if __name__ == "__main__":
     main()
+
+
