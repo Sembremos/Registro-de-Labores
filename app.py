@@ -2,12 +2,13 @@
 # RLD – 2025 (Versión 1.0)
 # =========================
 # - Contraseñas INICIALES FIJAS para entregar (sin aleatorios)
-# - Migración automática de hashes a las claves fijas
-# - Cambio de contraseña por el propio usuario
+# - Migración automática: actualiza password_hash existentes a las claves fijas
+# - Cada usuario puede CAMBIAR su contraseña en "Mi Perfil"
 # - CRUD por usuario (solo ve/edita/borra lo propio)
-# - Panel Admin (validación, observación, reset a clave fija, activar/inactivar, export, resumen)
-# - Google Sheets con Service Account (normalización de private_key)
-# - Compatibilidad Streamlit 1.30+ con _rerun()
+# - Admin (vperaza) ve todo, valida/rechaza, observa, resetea a contraseña fija
+# - Resumen por usuario y logs
+# - Google Sheets vía gspread (Service Account; normaliza private_key)
+# - Compatibilidad Streamlit 1.30+ (_rerun usa st.rerun con fallback)
 
 import time
 import hashlib
@@ -74,11 +75,10 @@ TRABAJOS_CATALOGO = [
     "Control de Vías", "Tareas Administrativas"
 ]
 
-# ========= Utilidades de tiempo =========
+# ========= Utilidades =========
 def iso_now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ========= Seguridad / contraseñas =========
 def hash_password(pwd: str) -> str:
     return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
 
@@ -92,13 +92,12 @@ def get_gspread_client():
         st.error("Faltan credenciales en st.secrets['gcp_service_account'].")
         st.stop()
 
-    # Copiamos y normalizamos secrets
     info = dict(st.secrets["gcp_service_account"])
-    # 🔧 Convierte '\n' literales en saltos de línea reales
+    # Normaliza el private_key: convierte '\n' literales a saltos reales
     if isinstance(info.get("private_key"), str):
         info["private_key"] = info["private_key"].replace("\\n", "\n").replace("\r\n", "\n")
 
-    # Guardamos correo del SA para diagnóstico
+    # Guardamos el email para referencia si se requiere
     st.session_state["_svc_email"] = info.get("client_email", "desconocido")
 
     try:
@@ -112,27 +111,30 @@ def get_gspread_client():
         return gspread.authorize(creds)
     except Exception:
         st.error("No se pudieron cargar las credenciales del Service Account.")
-        st.caption("Revisa que el private_key tenga saltos de línea reales y que las APIs de Sheets/Drive estén habilitadas.")
         st.stop()
 
-def _open_sheet():
+@st.cache_resource(show_spinner=False)
+def get_spreadsheet():
+    """Abre el spreadsheet una sola vez y lo cachea. Usa KEY del URL (más robusto)."""
     gc = get_gspread_client()
+    key = SPREADSHEET_URL.split("/d/")[1].split("/")[0]
+    # 1) por KEY
+    try:
+        return gc.open_by_key(key)
+    except APIError:
+        pass
+    # 2) fallback por URL
     try:
         return gc.open_by_url(SPREADSHEET_URL)
-    except APIError:
-        # Fallback por KEY
-        try:
-            key = SPREADSHEET_URL.split("/d/")[1].split("/")[0]
-            return gc.open_by_key(key)
-        except Exception:
-            svc = st.session_state.get("_svc_email", "(sin email)")
-            st.error("No se pudo abrir el Spreadsheet por permisos o URL.")
-            st.markdown(
-                f"- Comparte la hoja con **{svc}** como *Editor*.\n"
-                f"- Confirma que la URL/KEY es correcta.\n"
-                f"- Habilita **Google Sheets API** y **Google Drive API** en el proyecto del Service Account."
-            )
-            st.stop()
+    except Exception:
+        svc = st.session_state.get("_svc_email", "(sin email)")
+        st.error("No se pudo abrir el Spreadsheet.")
+        st.markdown(
+            f"- Comparte la hoja con **{svc}** como *Editor*.\n"
+            f"- Confirma que la URL/KEY es correcta.\n"
+            f"- Habilita **Google Sheets API** y **Google Drive API** en el proyecto del Service Account."
+        )
+        st.stop()
 
 def _ensure_ws(sh, title: str, header: List[str]):
     try:
@@ -146,12 +148,12 @@ def _ensure_ws(sh, title: str, header: List[str]):
     return ws
 
 def _ws_usuarios():
-    sh = _open_sheet()
+    sh = get_spreadsheet()
     header = ["id", "nombre", "usuario", "rol", "password_hash", "activo", "creado_en", "ultimo_acceso"]
     return _ensure_ws(sh, SHEET_USUARIOS, header)
 
 def _ws_respuestas():
-    sh = _open_sheet()
+    sh = get_spreadsheet()
     header = [
         "uuid", "usuario_id", "usuario_nombre", "fecha", "hora",
         "trabajo_realizado", "localidad_delegacion", "funcionario_responsable",
@@ -161,12 +163,12 @@ def _ws_respuestas():
     return _ensure_ws(sh, SHEET_RESPUESTAS, header)
 
 def _ws_resumen():
-    sh = _open_sheet()
+    sh = get_spreadsheet()
     header = ["usuario_id", "usuario_nombre", "total", "pendientes", "validadas", "rechazadas", "ultima_actividad"]
     return _ensure_ws(sh, SHEET_RESUMEN, header)
 
 def _ws_logs():
-    sh = _open_sheet()
+    sh = get_spreadsheet()
     header = ["evento", "quien", "detalle", "timestamp"]
     return _ensure_ws(sh, SHEET_LOGS, header)
 
@@ -647,27 +649,10 @@ def view_perfil(usuario_ctx: Dict):
 
 # ========= Main =========
 def main():
-    # Diagnóstico rápido (opcional: puedes ocultarlo si gustas)
-    with st.expander("🔎 Diagnóstico de Google Sheets"):
-        st.write("Service Account:", st.session_state.get("_svc_email", "desconocido"))
-        try:
-            sh = _open_sheet()
-            st.success(f"OK: {sh.title}")
-            st.write("Pestañas:", [w.title for w in sh.worksheets()])
-        except Exception as e:
-            st.exception(e)
-            st.stop()
-
-    seeded = seed_usuarios_si_vacio()
-    migrados = migrate_passwords_a_fijas()
-    if seeded or migrados:
-        with st.expander("✅ Credenciales iniciales/fijas"):
-            st.write(pd.DataFrame(
-                [{"nombre": n, "usuario": u, "password_inicial": PASSWORDS_FIJAS[u], "rol": r}
-                 for _, n, u, r in USUARIOS_INICIALES]
-            ))
-            if migrados:
-                st.success(f"Se actualizaron {migrados} usuarios a las contraseñas fijas.")
+    seed_usuarios_si_vacio()          # crea usuarios (si fuera necesario)
+    migrados = migrate_passwords_a_fijas()  # fuerza contraseñas fijas si no coinciden
+    if migrados:
+        st.toast(f"Actualizados {migrados} usuarios a contraseñas fijas.", icon="✅")
 
     view_portada()
 
@@ -699,6 +684,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
