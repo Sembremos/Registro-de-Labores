@@ -1,7 +1,7 @@
 # =========================
-# RLD – 2025 (con Google Sheets) – APP PRINCIPAL (VIVIANA)
+# RLD – 2025 (Google Sheets) – APP ADMIN (VIVIANA)
 # =========================
-import time, hashlib, json
+import time, hashlib
 from datetime import datetime, date, timedelta
 from typing import List, Dict
 import streamlit as st
@@ -12,10 +12,10 @@ import gspread
 from gspread.exceptions import APIError, WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
-st.set_page_config(page_title="RLD 2025 – Viviana (Admin)", layout="wide")
-APP_TITLE = "REGISTRO DE LABORES DIARIAS – Admin (Sheets)"
+st.set_page_config(page_title="RLD 2025 – Admin (Sheets)", layout="wide")
+APP_TITLE = "REGISTRO DE LABORES DIARIAS – Admin"
 
-# === URL del Spreadsheet (el tuyo) ===
+# === TU SPREADSHEET ===
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1LiHP1V5PMzt13yX_zgSeVFmZ7r-HM6PPEI5Ej46ziPk/edit?usp=sharing"
 
 # ---------- Usuarios iniciales ----------
@@ -30,31 +30,31 @@ USUARIOS_INICIALES = [
     ("009", "Viviana Peraza", "vperaza", "admin"),
     ("010", "Charly",  "charly",  "user"),
 ]
-
 PASSWORDS_FIJAS = {
     "jeremy":"jeremy2025","jannia":"jannia2025","manfred":"manfred2025","luis":"luis2025",
     "adrian":"adrian2025","esteban":"esteban2025","pamela":"pamela2025",
     "charly":"charly2025","vperaza":"viviana2025"
 }
 
+# ---------- Nombres de hojas ----------
 SHEET_USUARIOS   = "Usuarios"
 SHEET_TAREAS     = "RLD_tareas"
 SHEET_RESPUESTAS = "RLD_respuestas"
 SHEET_RESUMEN    = "RLD_por_usuario"
 SHEET_LOGS       = "Logs"
 
-PRIORIDADES = ["Alta","Media","Baja"]          # Alta=naranja, Media=rojo, Baja=verde
+PRIORIDADES   = ["Alta","Media","Baja"]            # Alta=naranja, Media=rojo, Baja=verde
 ESTADOS_TAREA = ["Nueva","En Progreso","Completada","Rechazada"]
 
 # ========= Utilidades =========
 def iso_now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def hash_password(p): return hashlib.sha256(p.encode("utf-8")).hexdigest()
 def _as_bool(x): return str(x).strip().lower() in ("true","1","yes","si","sí")
-def tag_prioridad_html(p: str) -> str:
+def _tag_prioridad(p: str) -> str:
     p = (p or "").strip().title()
-    color = "#22c55e"  # Baja = verde
-    if p == "Alta":   color = "#f59e0b"  # naranja (máxima)
-    elif p == "Media": color = "#ef4444"  # rojo (urge)
+    color = "#22c55e"           # verde = Baja
+    if p == "Alta":  color = "#f59e0b"   # naranja = máxima
+    if p == "Media": color = "#ef4444"   # rojo = urge
     return f"<span style='background:{color};color:white;padding:2px 8px;border-radius:999px;font-size:12px'>{p}</span>"
 
 # ========= Conexión Google Sheets =========
@@ -80,13 +80,7 @@ def get_spreadsheet():
     try:
         return gc.open_by_key(key)
     except APIError:
-        try:
-            return gc.open_by_url(SPREADSHEET_URL)
-        except Exception:
-            svc = st.session_state.get("_svc_email","(sin email)")
-            st.error("No se pudo abrir el Spreadsheet.")
-            st.markdown(f"- Comparte la hoja con **{svc}** como *Editor*.")
-            st.stop()
+        return gc.open_by_url(SPREADSHEET_URL)
 
 def _ensure_ws(title: str, header: List[str]):
     sh = get_spreadsheet()
@@ -95,33 +89,41 @@ def _ensure_ws(title: str, header: List[str]):
     except WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=2000, cols=max(len(header), 12))
         ws.append_row(header)
+    # asegura header si está vacío
     vals = ws.get_all_values()
     if not vals:
         ws.append_row(header)
     return ws
 
-def ws_usuarios():   return _ensure_ws(SHEET_USUARIOS, ["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
-def ws_tareas():     return _ensure_ws(SHEET_TAREAS,   ["task_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
-def ws_respuestas(): return _ensure_ws(SHEET_RESPUESTAS,["uuid","task_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
-def ws_resumen():    return _ensure_ws(SHEET_RESUMEN,  ["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
-def ws_logs():       return _ensure_ws(SHEET_LOGS,     ["evento","quien","detalle","timestamp"])
+def ws_usuarios():   return _ensure_ws(SHEET_USUARIOS,   ["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
+def ws_tareas():     return _ensure_ws(SHEET_TAREAS,     ["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+def ws_respuestas(): return _ensure_ws(SHEET_RESPUESTAS, ["uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
+def ws_resumen():    return _ensure_ws(SHEET_RESUMEN,    ["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
+def ws_logs():       return _ensure_ws(SHEET_LOGS,       ["evento","quien","detalle","timestamp"])
 
-# ========= DataFrames =========
+# ========= DataFrames + compat con hojas viejas =========
 def df_usuarios():
     recs = ws_usuarios().get_all_records()
     df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
     if not df.empty:
-        df["activo_norm"] = df["activo"].apply(_as_bool)
         df["rol_norm"] = df["rol"].astype(str).str.lower()
+        df["activo_norm"] = df["activo"].apply(_as_bool)
     return df
 
 def df_tareas():
     recs = ws_tareas().get_all_records()
-    return pd.DataFrame(recs) if recs else pd.DataFrame(columns=["task_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+    # compat si existiera 'task_id'
+    if "task_id" in df.columns and "tarea_id" not in df.columns:
+        df = df.rename(columns={"task_id":"tarea_id"})
+    return df
 
 def df_respuestas():
     recs = ws_respuestas().get_all_records()
-    return pd.DataFrame(recs) if recs else pd.DataFrame(columns=["uuid","task_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
+    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
+    if "task_id" in df.columns and "tarea_id" not in df.columns:
+        df = df.rename(columns={"task_id":"tarea_id"})
+    return df
 
 def log(evento, quien, detalle): ws_logs().append_row([evento, quien, detalle, iso_now()])
 
@@ -130,9 +132,8 @@ def seed_usuarios_si_vacio():
     ws = ws_usuarios()
     if ws.get_all_records(): return False
     for (id_, nombre, usuario, rol) in USUARIOS_INICIALES:
-        pwd_fija = PASSWORDS_FIJAS[usuario]
-        ws.append_row([id_, nombre, usuario, rol, hash_password(pwd_fija), True, iso_now(), ""])
-    log("seed_usuarios","sistema",f"{len(USUARIOS_INICIALES)} sembrados")
+        ws.append_row([id_, nombre, usuario, rol, hash_password(PASSWORDS_FIJAS[usuario]), True, iso_now(), ""])
+    log("seed_usuarios","sistema","OK")
     return True
 
 def migrate_passwords_a_fijas():
@@ -145,11 +146,239 @@ def migrate_passwords_a_fijas():
         if usuario in PASSWORDS_FIJAS:
             nuevo = hash_password(PASSWORDS_FIJAS[usuario])
             if str(r.get("password_hash","")) != nuevo:
-                ws.update_cell(i, 5, nuevo)
-                actualizados += 1
-    if actualizados:
-        log("migracion_passwords","sistema",f"{actualizados} actualizados")
+                ws.update_cell(i, 5, nuevo); actualizados += 1
+    if actualizados: log("migracion_passwords","sistema",f"{actualizados}")
     return actualizados
+
+# === Secuenciador de IDs ===
+def next_tarea_id(n: int = 1) -> int:
+    """Devuelve el próximo ID disponible (entero). Si 'n'>1, simplemente retorna el primero y los siguientes son +1."""
+    df = df_tareas()
+    if df.empty or df["tarea_id"].replace("", pd.NA).isna().all():
+        return 1
+    try:
+        maxid = pd.to_numeric(df["tarea_id"], errors="coerce").fillna(0).astype(int).max()
+    except Exception:
+        maxid = 0
+    return int(maxid) + 1
+
+# ========= Auth =========
+def do_login():
+    st.subheader("Ingreso (Solo Admin)")
+    usuario = st.text_input("Usuario (p.ej. vperaza)")
+    pwd = st.text_input("Contraseña", type="password")
+    if st.button("Entrar", use_container_width=True):
+        dfu = df_usuarios()
+        row = dfu[dfu["usuario"].astype(str).str.lower()==usuario.strip().lower()]
+        if row.empty: st.error("Usuario no encontrado."); return
+        row = row.iloc[0]
+        if not _as_bool(row.get("activo", True)): st.error("Usuario inactivo."); return
+        if str(row["rol"]).lower()!="admin": st.error("Acceso solo admin."); return
+        if hash_password(pwd) != str(row.get("password_hash","")): st.error("Contraseña incorrecta."); return
+        st.session_state.auth = {"id":str(row["id"]), "nombre":row["nombre"], "usuario":row["usuario"], "rol":row["rol"]}
+        # último acceso
+        w = ws_usuarios(); c = w.find(str(row["id"])); 
+        if c: w.update_cell(c.row, 8, iso_now())
+        log("login_admin", row["usuario"], "OK"); st.rerun()
+
+def logout_btn():
+    with st.sidebar:
+        st.caption(f"Conectada como **{st.session_state['auth']['nombre']}**")
+        if st.button("Cerrar sesión", use_container_width=True):
+            st.session_state.pop("auth", None); st.rerun()
+
+# ========= Vistas =========
+def portada():
+    st.title(APP_TITLE)
+    st.info("Aquí Viviana **activa/inactiva usuarios**, **crea tareas** con **ID incremental** (1,2,3…), "
+            "**edita**, **elimina**, cambia **estado** y agrega **observación**. "
+            "Prioridad: **Alta=naranja**, **Media=rojo**, **Baja=verde**.")
+    st.divider()
+
+def view_usuarios():
+    st.subheader("Usuarios (activar/inactivar)")
+    dfu = df_usuarios()
+    mostrar = dfu[["id","nombre","usuario","activo"]].sort_values("nombre")
+    st.dataframe(mostrar, use_container_width=True, hide_index=True)
+
+    sel = st.selectbox("Selecciona usuario", mostrar["nombre"].tolist())
+    if st.button("Alternar activo/inactivo", use_container_width=True):
+        w = ws_usuarios(); recs = w.get_all_records()
+        for i, r in enumerate(recs, start=2):
+            if r.get("nombre")==sel:
+                val = str(r.get("activo","TRUE")).upper()
+                nuevo = "FALSE" if val in ("TRUE","1") else "TRUE"
+                w.update_cell(i, 6, nuevo)
+                st.success(f"{sel} -> {'Activo' if nuevo=='TRUE' else 'Inactivo'}")
+                log("toggle_activo", st.session_state['auth']['usuario'], f"{sel}:{nuevo}")
+                break
+
+def view_tareas(usuario_ctx: Dict):
+    st.subheader("Delegar tareas a múltiples usuarios")
+
+    dfu = df_usuarios()
+    dfu_activos = dfu[(dfu["rol_norm"]=="user") & (dfu["activo_norm"])]
+    lista = dfu_activos["nombre"].tolist()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        titulo = st.text_input("Título de la tarea")
+        descripcion = st.text_area("Descripción / Instrucciones")
+        prioridad = st.selectbox("Prioridad", PRIORIDADES, index=0)  # Alta por defecto
+    with c2:
+        asignados_nombres = st.multiselect("Asignar a (múltiples)", lista, default=["Charly"] if "Charly" in lista else None)
+        fecha_lim = st.date_input("Fecha límite", value=date.today() + timedelta(days=3))
+
+    if st.button("Crear y asignar", type="primary", use_container_width=True, disabled=not titulo.strip() or not asignados_nombres):
+        w = ws_tareas()
+        base_id = next_tarea_id()
+        created = 0
+        for idx, nom in enumerate(asignados_nombres):
+            u = dfu_activos[dfu_activos["nombre"]==nom].iloc[0]
+            tid = base_id + idx
+            w.append_row([tid, titulo.strip(), descripcion.strip(), prioridad, "Nueva",
+                          str(u["id"]), u["nombre"], iso_now(), str(fecha_lim),
+                          usuario_ctx["usuario"], "", iso_now()])
+            created += 1
+        st.success(f"Se crearon {created} tareas (IDs desde #{base_id}).")
+        log("crear_tareas", usuario_ctx["usuario"], f"{created}")
+
+    st.markdown("---")
+    st.markdown("### Listado / Gestión")
+    dft = df_tareas()
+
+    f1,f2,f3,f4 = st.columns(4)
+    with f1: f_estado = st.selectbox("Estado", ["(Todos)"]+ESTADOS_TAREA)
+    with f2: f_prior  = st.selectbox("Prioridad", ["(Todas)"]+PRIORIDADES)
+    with f3: f_user   = st.selectbox("Asignado", ["(Todos)"] + (sorted(dft["asignado_nombre"].unique()) if not dft.empty else []))
+    with f4: q_titulo = st.text_input("Buscar por título", "")
+
+    data = dft.copy()
+    if not data.empty:
+        if f_estado!="(Todos)": data = data[data["estado"]==f_estado]
+        if f_prior!="(Todas)":  data = data[data["prioridad"]==f_prior]
+        if f_user!="(Todos)":   data = data[data["asignado_nombre"]==f_user]
+        if q_titulo.strip():    data = data[data["titulo"].astype(str).str.contains(q_titulo.strip(), case=False, na=False)]
+
+    if not data.empty:
+        data = data.copy()
+        data["prioridad_tag"] = data["prioridad"].apply(_tag_prioridad)
+        cols = ["tarea_id","titulo","prioridad_tag","estado","asignado_nombre","fecha_limite","fecha_asignacion"]
+        st.write(data[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
+    else:
+        st.info("Sin tareas.")
+
+    st.markdown("#### Editar / Eliminar / Estado / Observación")
+    # Selector amigable por título
+    opciones = []
+    if not dft.empty:
+        dft_sorted = dft.sort_values("tarea_id")
+        opciones = [f"#{int(r.tarea_id)} — {r.titulo} — {r.asignado_nombre}" for _, r in dft_sorted.iterrows()]
+    sel_opt = st.selectbox("Selecciona una tarea", opciones) if opciones else ""
+    tarea_id_input = st.number_input("…o escribe el ID (#)", min_value=1, value=1 if not dft.empty else 1, step=1)
+    def _resolver_id():
+        if sel_opt:
+            return int(sel_opt.split("—")[0].replace("#","").strip())
+        return int(tarea_id_input)
+
+    c1,c2,c3,c4 = st.columns(4)
+    with c1:
+        if st.button("Nueva", use_container_width=True, disabled=dft.empty):
+            _admin_set_estado(_resolver_id(), "Nueva", usuario_ctx)
+    with c2:
+        if st.button("En Progreso", use_container_width=True, disabled=dft.empty):
+            _admin_set_estado(_resolver_id(), "En Progreso", usuario_ctx)
+    with c3:
+        if st.button("Completada", use_container_width=True, disabled=dft.empty):
+            _admin_set_estado(_resolver_id(), "Completada", usuario_ctx)
+    with c4:
+        if st.button("Rechazada", use_container_width=True, disabled=dft.empty):
+            _admin_set_estado(_resolver_id(), "Rechazada", usuario_ctx)
+
+    st.markdown("##### Editar campos")
+    with st.form("editar_tarea"):
+        et_titulo = st.text_input("Título")
+        et_desc   = st.text_area("Descripción")
+        et_prior  = st.selectbox("Prioridad", PRIORIDADES)
+        # reasignar (uno)
+        et_user   = st.selectbox("Asignado a", dfu[(dfu["rol_norm"]=="user") & (dfu["activo_norm"])]["nombre"].tolist())
+        et_flim   = st.date_input("Fecha límite", value=date.today()+timedelta(days=3))
+        enviado = st.form_submit_button("Guardar cambios en tarea seleccionada", use_container_width=True, disabled=dft.empty)
+    if enviado:
+        _admin_editar_tarea(_resolver_id(), et_titulo, et_desc, et_prior, et_user, et_flim, usuario_ctx)
+
+    st.markdown("##### Eliminar")
+    if st.button("Eliminar tarea seleccionada", disabled=dft.empty, type="secondary"):
+        _admin_eliminar_tarea(_resolver_id(), usuario_ctx)
+
+    st.markdown("##### Observación administrativa")
+    obs = st.text_area("Observación")
+    if st.button("Guardar observación", disabled=dft.empty):
+        _admin_guardar_observacion(_resolver_id(), obs, usuario_ctx)
+
+def _admin_set_estado(tid: int, nuevo: str, usuario_ctx: Dict):
+    w = ws_tareas(); recs = w.get_all_records()
+    for i, r in enumerate(recs, start=2):
+        try:
+            if int(r.get("tarea_id", 0)) == int(tid):
+                w.update_cell(i, 5, nuevo)      # estado
+                w.update_cell(i, 12, iso_now()) # ultima_actualizacion
+                st.success("Estado actualizado.")
+                log("tarea_estado", usuario_ctx["usuario"], f"{tid}->{nuevo}")
+                return
+        except Exception:
+            pass
+    st.error("No se encontró la tarea.")
+
+def _admin_guardar_observacion(tid: int, texto: str, usuario_ctx: Dict):
+    w = ws_tareas(); recs = w.get_all_records()
+    for i, r in enumerate(recs, start=2):
+        try:
+            if int(r.get("tarea_id", 0)) == int(tid):
+                w.update_cell(i, 11, texto)     # observ_admin
+                w.update_cell(i, 12, iso_now())
+                st.success("Observación guardada.")
+                log("tarea_obs", usuario_ctx["usuario"], f"{tid}")
+                return
+        except Exception:
+            pass
+    st.error("No se encontró la tarea.")
+
+def _admin_editar_tarea(tid: int, titulo: str, desc: str, prior: str, asignado_nombre: str, fecha_limite: date, usuario_ctx: Dict):
+    dfu = df_usuarios()
+    rowu = dfu[(dfu["nombre"]==asignado_nombre) & (dfu["rol_norm"]=="user")]
+    if rowu.empty:
+        st.error("Usuario destino inválido o inactivo.")
+        return
+    asig = rowu.iloc[0]
+    w = ws_tareas(); recs = w.get_all_records()
+    for i, r in enumerate(recs, start=2):
+        try:
+            if int(r.get("tarea_id", 0)) == int(tid):
+                w.update(f"A{i}:L{i}", [[
+                    tid, titulo.strip(), desc.strip(), prior, r.get("estado","Nueva"),
+                    str(asig["id"]), asig["nombre"], r.get("fecha_asignacion", iso_now()), str(fecha_limite),
+                    usuario_ctx["usuario"], r.get("observ_admin",""), iso_now()
+                ]])
+                st.success("Tarea actualizada.")
+                log("tarea_editar", usuario_ctx["usuario"], f"{tid}")
+                return
+        except Exception:
+            pass
+    st.error("No se encontró la tarea.")
+
+def _admin_eliminar_tarea(tid: int, usuario_ctx: Dict):
+    w = ws_tareas(); recs = w.get_all_records()
+    for i, r in enumerate(recs, start=2):
+        try:
+            if int(r.get("tarea_id", 0)) == int(tid):
+                w.delete_rows(i)
+                st.success("Tarea eliminada.")
+                log("tarea_eliminar", usuario_ctx["usuario"], f"{tid}")
+                return
+        except Exception:
+            pass
+    st.error("No se encontró la tarea.")
 
 def actualizar_resumen():
     wsr = ws_resumen()
@@ -172,141 +401,9 @@ def actualizar_resumen():
             except: pass
         wsr.append_row([uid, uname, tot, pen, val, rec, ult])
 
-# ========= Auth =========
-def do_login():
-    st.subheader("Ingreso (Solo Admin)")
-    usuario = st.text_input("Usuario", placeholder="vperaza")
-    pwd = st.text_input("Contraseña", type="password")
-    if st.button("Entrar", use_container_width=True):
-        dfu = df_usuarios()
-        if dfu.empty: st.error("No hay usuarios."); return
-        row = dfu[dfu["usuario"].astype(str).str.lower()==usuario.strip().lower()]
-        if row.empty: st.error("Usuario no encontrado o inactivo."); return
-        row = row.iloc[0]
-        if not _as_bool(row.get("activo", True)): st.error("Usuario inactivo."); return
-        if str(row["rol"]).lower()!="admin": st.error("Acceso solo admin."); return
-        if hash_password(pwd) != str(row["password_hash"]): st.error("Contraseña incorrecta."); return
-        st.session_state.auth = {"id":str(row["id"]), "nombre":row["nombre"], "usuario":row["usuario"], "rol":row["rol"]}
-        # último acceso
-        cell = ws_usuarios().find(str(row["id"])); 
-        if cell: ws_usuarios().update_cell(cell.row, 8, iso_now())
-        log("login_admin", row["usuario"], "OK"); st.rerun()
-
-def logout_btn():
-    with st.sidebar:
-        st.caption(f"Conectada como **{st.session_state['auth']['nombre']}**")
-        if st.button("Cerrar sesión", use_container_width=True):
-            st.session_state.pop("auth", None); st.rerun()
-
-# ========= Vistas =========
-def portada():
+def portada_inicial():
     st.title(APP_TITLE)
-    st.info("Desde aquí Viviana **activa/inactiva usuarios** y **delegará tareas a múltiples usuarios**.\n"
-            "Prioridad: **Alta=naranja**, **Media=rojo**, **Baja=verde**.")
     st.divider()
-
-def view_usuarios():
-    st.subheader("Usuarios (activar/inactivar)")
-    dfu = df_usuarios()
-    mostrar = dfu[["id","nombre","usuario","activo"]].sort_values("nombre")
-    st.dataframe(mostrar, use_container_width=True, hide_index=True)
-
-    sel = st.selectbox("Selecciona usuario", mostrar["nombre"].tolist())
-    if st.button("Alternar activo/inactivo", use_container_width=True):
-        w = ws_usuarios()
-        recs = w.get_all_records()
-        for i, r in enumerate(recs, start=2):
-            if r.get("nombre")==sel:
-                val = str(r.get("activo","TRUE")).upper()
-                nuevo = "FALSE" if val in ("TRUE","1") else "TRUE"
-                w.update_cell(i, 6, nuevo)
-                st.success(f"{sel} -> {'Activo' if nuevo=='TRUE' else 'Inactivo'}")
-                log("toggle_activo", st.session_state['auth']['usuario'], f"{sel} -> {nuevo}")
-                break
-
-def view_tareas(usuario_ctx: Dict):
-    st.subheader("Delegar tareas a múltiples usuarios")
-
-    dfu = df_usuarios()
-    dfu_activos = dfu[(dfu["rol_norm"]=="user") & (dfu["activo_norm"])]
-    lista = dfu_activos["nombre"].tolist()
-
-    c1, c2 = st.columns(2)
-    with c1:
-        titulo = st.text_input("Título de la tarea")
-        descripcion = st.text_area("Descripción / Instrucciones")
-        prioridad = st.selectbox("Prioridad", PRIORIDADES, index=0)  # Alta por defecto
-    with c2:
-        asignados_nombres = st.multiselect("Asignar a (múltiples)", lista, default=["Charly"] if "Charly" in lista else None)
-        fecha_lim = st.date_input("Fecha límite", value=date.today() + timedelta(days=3))
-
-    if st.button("Crear y asignar", type="primary", use_container_width=True, disabled=not titulo.strip() or not asignados_nombres):
-        w = ws_tareas()
-        base = int(time.time()*1000)
-        for nom in asignados_nombres:
-            urow = dfu_activos[dfu_activos["nombre"]==nom].iloc[0]
-            tid = f"T{base}-{urow['id']}"
-            w.append_row([tid, titulo.strip(), descripcion.strip(), prioridad, "Nueva",
-                          str(urow["id"]), urow["nombre"], iso_now(), str(fecha_lim),
-                          usuario_ctx["usuario"], "", iso_now()])
-        st.success(f"Creada(s) {len(asignados_nombres)} tarea(s).")
-        log("crear_tareas", usuario_ctx["usuario"], f"{len(asignados_nombres)}")
-    
-    st.markdown("---")
-    st.markdown("### Listado / Gestión")
-    dft = df_tareas()
-    # filtros
-    f1,f2,f3,f4 = st.columns(4)
-    with f1: f_estado = st.selectbox("Estado", ["(Todos)"]+ESTADOS_TAREA)
-    with f2: f_prior  = st.selectbox("Prioridad", ["(Todas)"]+PRIORIDADES)
-    with f3: f_user   = st.selectbox("Asignado", ["(Todos)"] + (sorted(dft["asignado_nombre"].unique()) if not dft.empty else []))
-    with f4: solo_vig = st.checkbox("Solo no vencidas", value=False)
-
-    data = dft.copy()
-    if not data.empty:
-        if f_estado!="(Todos)": data = data[data["estado"]==f_estado]
-        if f_prior!="(Todas)":  data = data[data["prioridad"]==f_prior]
-        if f_user!="(Todos)":   data = data[data["asignado_nombre"]==f_user]
-        if solo_vig:
-            data = data[pd.to_datetime(data["fecha_limite"], errors="coerce") >= pd.Timestamp(date.today())]
-
-    if not data.empty:
-        data = data.copy()
-        data["prioridad_tag"] = data["prioridad"].apply(tag_prioridad_html)
-        cols = ["task_id","titulo","prioridad_tag","estado","asignado_id","asignado_nombre","fecha_limite","fecha_asignacion"]
-        st.write(data[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
-    else:
-        st.info("Sin tareas.")
-
-    st.markdown("#### Cambiar estado / Observación")
-    tid = st.text_input("ID de tarea (task_id)")
-    c1,c2,c3,c4 = st.columns(4)
-    def _admin_set_estado(nvo):
-        w = ws_tareas(); c = w.find(tid)
-        if not c: st.error("No se encontró la tarea."); return
-        w.update_cell(c.row, 5, nvo); w.update_cell(c.row, 12, iso_now())
-        st.success("Estado actualizado."); log("tarea_estado", usuario_ctx["usuario"], f"{tid}->{nvo}")
-    with c1:
-        if st.button("Nueva", use_container_width=True, disabled=not tid.strip()): _admin_set_estado("Nueva")
-    with c2:
-        if st.button("En Progreso", use_container_width=True, disabled=not tid.strip()): _admin_set_estado("En Progreso")
-    with c3:
-        if st.button("Completada", use_container_width=True, disabled=not tid.strip()): _admin_set_estado("Completada")
-    with c4:
-        if st.button("Rechazada", use_container_width=True, disabled=not tid.strip()): _admin_set_estado("Rechazada")
-
-    obs = st.text_area("Observación administrativa")
-    if st.button("Guardar observación", disabled=not tid.strip()):
-        w = ws_tareas(); c = w.find(tid)
-        if not c: st.error("No se encontró la tarea.")
-        else:
-            w.update_cell(c.row, 11, obs); w.update_cell(c.row, 12, iso_now())
-            st.success("Observación guardada."); log("tarea_obs", usuario_ctx["usuario"], tid)
-
-def view_resumen():
-    if st.button("Recalcular resumen"):
-        actualizar_resumen(); st.success("Resumen actualizado.")
-    st.dataframe(pd.DataFrame(ws_resumen().get_all_records()), use_container_width=True, hide_index=True)
 
 # ========= Main =========
 def main():
@@ -318,16 +415,17 @@ def main():
 
     if "auth" not in st.session_state:
         do_login(); return
-
     logout_btn()
     user = st.session_state["auth"]
 
     vista = st.sidebar.radio("Secciones", ["Usuarios", "Tareas", "Resumen"])
     if vista == "Usuarios":   view_usuarios()
     elif vista == "Tareas":   view_tareas(user)
-    else:                     view_resumen()
+    else:                     st.dataframe(pd.DataFrame(ws_resumen().get_all_records()), use_container_width=True, hide_index=True)
 
 if __name__ == "__main__":
     main()
+
+
 
 
