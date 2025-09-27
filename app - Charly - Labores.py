@@ -68,22 +68,33 @@ def _ensure_ws(title: str, header: List[str]):
     return ws
 
 def ws_usuarios():   return _ensure_ws(SHEET_USUARIOS,   ["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
-def ws_tareas():     return _ensure_ws(SHEET_TAREAS,     ["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+def ws_tareas():
+    ws = _ensure_ws(SHEET_TAREAS, ["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+    # migrar encabezado si existiera viejo
+    try:
+        hdr = ws.row_values(1)
+        if hdr and len(hdr) >= 1 and hdr[0].strip().lower() == "task_id":
+            ws.update_cell(1, 1, "tarea_id")
+    except Exception:
+        pass
+    return ws
 def ws_respuestas(): return _ensure_ws(SHEET_RESPUESTAS, ["uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
 def ws_logs():       return _ensure_ws(SHEET_LOGS,       ["evento","quien","detalle","timestamp"])
 
 # ---- dataframes (compat si hubiese task_id en datos viejos) ----
 def df_usuarios():   return pd.DataFrame(ws_usuarios().get_all_records())
+
 def df_tareas():
     df = pd.DataFrame(ws_tareas().get_all_records())
     if "task_id" in df.columns and "tarea_id" not in df.columns:
         df = df.rename(columns={"task_id":"tarea_id"})
+    df["tarea_id_num"] = pd.to_numeric(df.get("tarea_id"), errors="coerce")
     return df
+
 def df_respuestas():
     df = pd.DataFrame(ws_respuestas().get_all_records())
     if "task_id" in df.columns and "tarea_id" not in df.columns:
         df = df.rename(columns={"task_id":"tarea_id"})
-    # asegure columnas mínimas para evitar KeyError
     for col in ["usuario_id","tarea_id"]:
         if col not in df.columns:
             df[col] = ""
@@ -94,7 +105,7 @@ def log(e,q,d): ws_logs().append_row([e,q,d,iso_now()])
 # ---- UI ----
 def portada():
     st.title(APP_TITLE)
-    st.info("Aquí Charly ve **sus tareas** (selector por *título + #id*) y registra **labores**. "
+    st.info("Aquí Charly ve **sus tareas** (selector por *título + #id*), registra **labores** y puede cambiar su **usuario/contraseña**. "
             "Si tu usuario está **inactivo**, no podrás ingresar.")
 
 def do_login():
@@ -110,9 +121,8 @@ def do_login():
         if str(row.get("rol","")).lower()!="user": st.error("Solo usuarios tipo 'user'."); return
         if not _as_bool(row.get("activo", True)): st.error("Tu usuario está INACTIVO. Contacta a la administradora."); return
         if hash_password(pwd) != str(row.get("password_hash","")): st.error("Contraseña incorrecta."); return
-        if usuario.strip().lower() != "charly": st.error("Esta app es solo para **Charly**."); return
+        if usuario.strip().lower() != "charly": st.warning("Puedes cambiar tu usuario en 'Mi Perfil', pero por ahora debe ser **charly**.")
         st.session_state.auth = {"id":str(row["id"]), "nombre":row["nombre"], "usuario":row["usuario"], "rol":row["rol"]}
-        # último acceso
         w = ws_usuarios(); c = w.find(str(row["id"])); 
         if c: w.update_cell(c.row, 8, iso_now())
         log("login_user","charly","OK"); st.rerun()
@@ -147,17 +157,28 @@ def view_mis_tareas(user: Dict):
 
     # Selector por título + id (sin escribir nada)
     st.markdown("### Cambiar estado")
-    opciones = [f"#{int(r.tarea_id)} — {r.titulo}" for _, r in mias.sort_values("tarea_id").iterrows()]
-    sel = st.selectbox("Selecciona una tarea", opciones)
-    sel_id = int(sel.split("—")[0].replace("#","").strip()) if sel else None
+    mias = mias.copy()
+    mias["tarea_id_num"] = pd.to_numeric(mias["tarea_id"], errors="coerce")
+    mias = mias.dropna(subset=["tarea_id_num"]).sort_values("tarea_id_num")
+
+    opciones = [f"#{int(r.tarea_id_num)} — {r.titulo}" for _, r in mias.iterrows()]
+    sel = st.selectbox("Selecciona una tarea", opciones) if len(opciones)>0 else ""
+    sel_id = None
+    if sel:
+        try:
+            sel_id = int(sel.split("—")[0].replace("#","").strip())
+        except Exception:
+            sel_id = None
 
     c1,c2,c3,c4 = st.columns(4)
     def _set_estado(nvo):
-        if sel_id is None: return
+        if sel_id is None: 
+            st.error("Selecciona una tarea válida."); 
+            return
         w = ws_tareas(); recs = w.get_all_records()
         for i, r in enumerate(recs, start=2):
             try:
-                if int(r.get("tarea_id", 0)) == sel_id and str(r.get("asignado_id")) == str(user["id"]):
+                if int(pd.to_numeric(r.get("tarea_id"), errors="coerce")) == sel_id and str(r.get("asignado_id")) == str(user["id"]):
                     w.update_cell(i, 5, nvo); w.update_cell(i, 12, iso_now())
                     st.success("Estado actualizado."); log("user_tarea_estado", user["usuario"], f"{sel_id}->{nvo}")
                     return
@@ -176,14 +197,22 @@ def view_mis_tareas(user: Dict):
 def view_registro(user: Dict):
     st.subheader("Registrar Labor y Vincular a Tarea")
     dft = df_tareas()
-    mias = dft[dft["asignado_id"].astype(str)==str(user["id"])]
-    opciones = ["(sin tarea)"] + [f"#{int(r.tarea_id)} — {r.titulo}" for _, r in mias.sort_values("tarea_id").iterrows()]
+    mias = dft[dft["asignado_id"].astype(str)==str(user["id"])].copy()
+    mias["tarea_id_num"] = pd.to_numeric(mias["tarea_id"], errors="coerce")
+    mias = mias.dropna(subset=["tarea_id_num"]).sort_values("tarea_id_num")
+    opciones = ["(sin tarea)"] + [f"#{int(r.tarea_id_num)} — {r.titulo}" for _, r in mias.iterrows()]
     sel = st.selectbox("Tarea relacionada (opcional)", opciones)
-    sel_id = "" if sel=="(sin tarea)" else int(sel.split("—")[0].replace("#","").strip())
+    if sel=="(sin tarea)":
+        sel_id = ""
+    else:
+        try:
+            sel_id = int(sel.split("—")[0].replace("#","").strip())
+        except Exception:
+            sel_id = ""
 
     c1,c2 = st.columns(2)
     with c1: f_fecha = st.date_input("Fecha", value=date.today())
-    with c2: f_hora = st.time_input("Hora", value=datetime.now().time())
+    with c2: f_hora  = st.time_input("Hora", value=datetime.now().time())
     trabajo   = st.selectbox("Trabajo Realizado", TRABAJOS_CATALOGO)
     localidad = st.text_input("Localidad / Delegación")
     obs       = st.text_area("Observaciones")
@@ -210,19 +239,66 @@ def view_mis_labores(user: Dict):
     else:
         st.dataframe(mine, use_container_width=True, hide_index=True)
 
+# ========= Mi Perfil (Usuario) =========
+def view_perfil(user: Dict):
+    st.subheader("Mi Perfil")
+    st.write(f"**Nombre:** {user['nombre']}  |  **Usuario actual:** `{user['usuario']}`")
+
+    st.markdown("#### Cambiar usuario y/o contraseña")
+    nuevo_usuario = st.text_input("Nuevo usuario (opcional)", placeholder="dejar vacío para no cambiar")
+    pwd_actual = st.text_input("Contraseña actual", type="password")
+    pwd_nueva  = st.text_input("Nueva contraseña", type="password", help="Mínimo 6 caracteres.")
+    pwd_conf   = st.text_input("Confirmar nueva contraseña", type="password")
+
+    if st.button("Guardar cambios", type="primary"):
+        dfu = df_usuarios()
+        row = dfu[dfu["usuario"].astype(str) == user["usuario"]]
+        if row.empty:
+            st.error("No se encontró el usuario."); return
+        row = row.iloc[0]
+        if hash_password(pwd_actual) != str(row.get("password_hash","")):
+            st.error("La contraseña actual es incorrecta."); return
+        if pwd_nueva and len(pwd_nueva) < 6:
+            st.error("La nueva contraseña debe tener al menos 6 caracteres."); return
+        # validar colisión de nombre de usuario si lo cambia
+        if nuevo_usuario.strip():
+            existe = dfu[dfu["usuario"].astype(str).str.lower()==nuevo_usuario.strip().lower()]
+            if not existe.empty:
+                st.error("Ese usuario ya existe. Elige otro."); return
+
+        w = ws_usuarios(); cell = w.find(str(row["id"]))
+        if not cell:
+            st.error("No se pudo ubicar tu fila en la hoja."); return
+
+        # actualizar usuario y/o password_hash
+        if nuevo_usuario.strip():
+            w.update_cell(cell.row, 3, nuevo_usuario.strip())
+            st.session_state.auth["usuario"] = nuevo_usuario.strip()
+        if pwd_nueva and pwd_nueva == pwd_conf:
+            w.update_cell(cell.row, 5, hash_password(pwd_nueva))
+        elif pwd_nueva or pwd_conf:
+            st.error("La confirmación no coincide."); return
+
+        log("user_update_profile", user["usuario"], "OK")
+        st.success("Cambios guardados. Si cambiaste usuario/contraseña, cierra sesión e ingresa de nuevo.")
+
 # ----------------- Main -----------------
 def main():
     portada()
+
     if "auth" not in st.session_state:
         do_login(); return
     user = st.session_state["auth"]; logout_btn()
 
-    vista = st.sidebar.radio("Secciones", ["Mis Tareas","Registrar Labor","Mis Labores"])
+    vista = st.sidebar.radio("Secciones", ["Mis Tareas","Registrar Labor","Mis Labores","Mi Perfil"])
     if vista == "Mis Tareas":        view_mis_tareas(user)
     elif vista == "Registrar Labor": view_registro(user)
-    else:                            view_mis_labores(user)
+    elif vista == "Mis Labores":     view_mis_labores(user)
+    else:                            view_perfil(user)
 
 if __name__ == "__main__":
     main()
+
+
 
 
