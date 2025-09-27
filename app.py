@@ -89,19 +89,32 @@ def _ensure_ws(title: str, header: List[str]):
     except WorksheetNotFound:
         ws = sh.add_worksheet(title=title, rows=2000, cols=max(len(header), 12))
         ws.append_row(header)
-    # asegura header si está vacío
     vals = ws.get_all_values()
     if not vals:
         ws.append_row(header)
     return ws
 
 def ws_usuarios():   return _ensure_ws(SHEET_USUARIOS,   ["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
-def ws_tareas():     return _ensure_ws(SHEET_TAREAS,     ["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
+
+def ws_tareas():
+    header = ["tarea_id","titulo","descripcion","prioridad","estado","asignado_id",
+              "asignado_nombre","fecha_asignacion","fecha_limite","creado_por",
+              "observ_admin","ultima_actualizacion"]
+    ws = _ensure_ws(SHEET_TAREAS, header)
+    # migrar encabezado si quedó "task_id"
+    try:
+        hdr = ws.row_values(1)
+        if hdr and len(hdr) >= 1 and hdr[0].strip().lower() == "task_id":
+            ws.update_cell(1, 1, "tarea_id")
+    except Exception:
+        pass
+    return ws
+
 def ws_respuestas(): return _ensure_ws(SHEET_RESPUESTAS, ["uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
 def ws_resumen():    return _ensure_ws(SHEET_RESUMEN,    ["usuario_id","usuario_nombre","total","pendientes","validadas","rechazadas","ultima_actividad"])
 def ws_logs():       return _ensure_ws(SHEET_LOGS,       ["evento","quien","detalle","timestamp"])
 
-# ========= DataFrames + compat con hojas viejas =========
+# ========= DataFrames =========
 def df_usuarios():
     recs = ws_usuarios().get_all_records()
     df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["id","nombre","usuario","rol","password_hash","activo","creado_en","ultimo_acceso"])
@@ -112,15 +125,23 @@ def df_usuarios():
 
 def df_tareas():
     recs = ws_tareas().get_all_records()
-    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["tarea_id","titulo","descripcion","prioridad","estado","asignado_id","asignado_nombre","fecha_asignacion","fecha_limite","creado_por","observ_admin","ultima_actualizacion"])
-    # compat si existiera 'task_id'
+    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=[
+        "tarea_id","titulo","descripcion","prioridad","estado","asignado_id",
+        "asignado_nombre","fecha_asignacion","fecha_limite","creado_por",
+        "observ_admin","ultima_actualizacion"
+    ])
     if "task_id" in df.columns and "tarea_id" not in df.columns:
         df = df.rename(columns={"task_id":"tarea_id"})
+    df["tarea_id_num"] = pd.to_numeric(df.get("tarea_id"), errors="coerce")
     return df
 
 def df_respuestas():
     recs = ws_respuestas().get_all_records()
-    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=["uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado","localidad_delegacion","funcionario_responsable","observaciones","estado_validacion","observacion_admin","creado_en","editado_en","creado_por","editado_por"])
+    df = pd.DataFrame(recs) if recs else pd.DataFrame(columns=[
+        "uuid","tarea_id","usuario_id","usuario_nombre","fecha","hora","trabajo_realizado",
+        "localidad_delegacion","funcionario_responsable","observaciones","estado_validacion",
+        "observacion_admin","creado_en","editado_en","creado_por","editado_por"
+    ])
     if "task_id" in df.columns and "tarea_id" not in df.columns:
         df = df.rename(columns={"task_id":"tarea_id"})
     return df
@@ -150,17 +171,32 @@ def migrate_passwords_a_fijas():
     if actualizados: log("migracion_passwords","sistema",f"{actualizados}")
     return actualizados
 
-# === Secuenciador de IDs ===
-def next_tarea_id(n: int = 1) -> int:
-    """Devuelve el próximo ID disponible (entero). Si 'n'>1, simplemente retorna el primero y los siguientes son +1."""
+def migrate_tarea_ids():
+    """Asigna IDs numéricos a tareas que no los tengan."""
     df = df_tareas()
-    if df.empty or df["tarea_id"].replace("", pd.NA).isna().all():
+    if df.empty:
+        return 0
+    ws = ws_tareas()
+    recs = ws.get_all_records()
+    usados = set(int(x) for x in pd.to_numeric(df["tarea_id"], errors="coerce").dropna().astype(int).tolist())
+    next_id = 1
+    asignados = 0
+    for i, r in enumerate(recs, start=2):
+        cur = pd.to_numeric(r.get("tarea_id"), errors="coerce")
+        if pd.isna(cur):
+            while next_id in usados:
+                next_id += 1
+            ws.update_cell(i, 1, next_id)
+            usados.add(next_id)
+            asignados += 1
+    return asignados
+
+# === Secuenciador de nuevos IDs ===
+def next_tarea_id() -> int:
+    df = df_tareas()
+    if df.empty or df["tarea_id_num"].dropna().empty:
         return 1
-    try:
-        maxid = pd.to_numeric(df["tarea_id"], errors="coerce").fillna(0).astype(int).max()
-    except Exception:
-        maxid = 0
-    return int(maxid) + 1
+    return int(df["tarea_id_num"].max()) + 1
 
 # ========= Auth =========
 def do_login():
@@ -176,7 +212,6 @@ def do_login():
         if str(row["rol"]).lower()!="admin": st.error("Acceso solo admin."); return
         if hash_password(pwd) != str(row.get("password_hash","")): st.error("Contraseña incorrecta."); return
         st.session_state.auth = {"id":str(row["id"]), "nombre":row["nombre"], "usuario":row["usuario"], "rol":row["rol"]}
-        # último acceso
         w = ws_usuarios(); c = w.find(str(row["id"])); 
         if c: w.update_cell(c.row, 8, iso_now())
         log("login_admin", row["usuario"], "OK"); st.rerun()
@@ -187,11 +222,39 @@ def logout_btn():
         if st.button("Cerrar sesión", use_container_width=True):
             st.session_state.pop("auth", None); st.rerun()
 
+# ========= Mi Perfil (Admin) =========
+def view_perfil_admin(user: Dict):
+    st.subheader("Mi Perfil (Admin)")
+    st.write(f"**Nombre:** {user['nombre']}  |  **Usuario:** `{user['usuario']}`  |  **Rol:** `{user['rol']}`")
+
+    pwd_actual = st.text_input("Contraseña actual", type="password")
+    pwd_nueva  = st.text_input("Nueva contraseña", type="password", help="Mínimo 6 caracteres.")
+    pwd_conf   = st.text_input("Confirmar nueva contraseña", type="password")
+
+    if st.button("Actualizar contraseña", type="primary"):
+        if len(pwd_nueva) < 6:
+            st.error("La nueva contraseña debe tener al menos 6 caracteres."); return
+        if pwd_nueva != pwd_conf:
+            st.error("La confirmación no coincide."); return
+        dfu = df_usuarios()
+        row = dfu[dfu["usuario"].astype(str) == user["usuario"]]
+        if row.empty:
+            st.error("No se encontró el usuario."); return
+        row = row.iloc[0]
+        if hash_password(pwd_actual) != str(row.get("password_hash","")):
+            st.error("La contraseña actual es incorrecta."); return
+        w = ws_usuarios(); cell = w.find(str(row["id"]))
+        if not cell:
+            st.error("No se pudo ubicar el registro del usuario en la hoja."); return
+        w.update_cell(cell.row, 5, hash_password(pwd_nueva))
+        log("admin_cambio_password", user["usuario"], "OK")
+        st.success("Contraseña actualizada. Vuelve a iniciar sesión si deseas.")
+
 # ========= Vistas =========
 def portada():
     st.title(APP_TITLE)
-    st.info("Aquí Viviana **activa/inactiva usuarios**, **crea tareas** con **ID incremental** (1,2,3…), "
-            "**edita**, **elimina**, cambia **estado** y agrega **observación**. "
+    st.info("Viviana **activa/inactiva usuarios**, **crea** tareas con **ID incremental** (1,2,3…), "
+            "**edita**, **elimina**, cambia **estado** y agrega **observación**.\n"
             "Prioridad: **Alta=naranja**, **Media=rojo**, **Baja=verde**.")
     st.divider()
 
@@ -250,7 +313,7 @@ def view_tareas(usuario_ctx: Dict):
     f1,f2,f3,f4 = st.columns(4)
     with f1: f_estado = st.selectbox("Estado", ["(Todos)"]+ESTADOS_TAREA)
     with f2: f_prior  = st.selectbox("Prioridad", ["(Todas)"]+PRIORIDADES)
-    with f3: f_user   = st.selectbox("Asignado", ["(Todos)"] + (sorted(dft["asignado_nombre"].unique()) if not dft.empty else []))
+    with f3: f_user   = st.selectbox("Asignado", ["(Todos)"] + (sorted(dft["asignado_nombre"].dropna().unique()) if not dft.empty else []))
     with f4: q_titulo = st.text_input("Buscar por título", "")
 
     data = dft.copy()
@@ -269,16 +332,21 @@ def view_tareas(usuario_ctx: Dict):
         st.info("Sin tareas.")
 
     st.markdown("#### Editar / Eliminar / Estado / Observación")
-    # Selector amigable por título
+    # Selector amigable por título (robusto a IDs vacíos)
     opciones = []
     if not dft.empty:
-        dft_sorted = dft.sort_values("tarea_id")
-        opciones = [f"#{int(r.tarea_id)} — {r.titulo} — {r.asignado_nombre}" for _, r in dft_sorted.iterrows()]
+        dft_sorted = dft.dropna(subset=["tarea_id_num"]).sort_values("tarea_id_num")
+        opciones = [f"#{int(r.tarea_id_num)} — {r.titulo} — {r.asignado_nombre}" for _, r in dft_sorted.iterrows()]
+
     sel_opt = st.selectbox("Selecciona una tarea", opciones) if opciones else ""
-    tarea_id_input = st.number_input("…o escribe el ID (#)", min_value=1, value=1 if not dft.empty else 1, step=1)
+    sugerido = int(dft["tarea_id_num"].max() + 1) if not dft.empty and not dft["tarea_id_num"].dropna().empty else 1
+    tarea_id_input = st.number_input("…o escribe el ID (#)", min_value=1, value=sugerido, step=1)
     def _resolver_id():
         if sel_opt:
-            return int(sel_opt.split("—")[0].replace("#","").strip())
+            try:
+                return int(sel_opt.split("—")[0].replace("#","").strip())
+            except Exception:
+                pass
         return int(tarea_id_input)
 
     c1,c2,c3,c4 = st.columns(4)
@@ -300,7 +368,6 @@ def view_tareas(usuario_ctx: Dict):
         et_titulo = st.text_input("Título")
         et_desc   = st.text_area("Descripción")
         et_prior  = st.selectbox("Prioridad", PRIORIDADES)
-        # reasignar (uno)
         et_user   = st.selectbox("Asignado a", dfu[(dfu["rol_norm"]=="user") & (dfu["activo_norm"])]["nombre"].tolist())
         et_flim   = st.date_input("Fecha límite", value=date.today()+timedelta(days=3))
         enviado = st.form_submit_button("Guardar cambios en tarea seleccionada", use_container_width=True, disabled=dft.empty)
@@ -320,7 +387,7 @@ def _admin_set_estado(tid: int, nuevo: str, usuario_ctx: Dict):
     w = ws_tareas(); recs = w.get_all_records()
     for i, r in enumerate(recs, start=2):
         try:
-            if int(r.get("tarea_id", 0)) == int(tid):
+            if int(pd.to_numeric(r.get("tarea_id"), errors="coerce")) == int(tid):
                 w.update_cell(i, 5, nuevo)      # estado
                 w.update_cell(i, 12, iso_now()) # ultima_actualizacion
                 st.success("Estado actualizado.")
@@ -334,7 +401,7 @@ def _admin_guardar_observacion(tid: int, texto: str, usuario_ctx: Dict):
     w = ws_tareas(); recs = w.get_all_records()
     for i, r in enumerate(recs, start=2):
         try:
-            if int(r.get("tarea_id", 0)) == int(tid):
+            if int(pd.to_numeric(r.get("tarea_id"), errors="coerce")) == int(tid):
                 w.update_cell(i, 11, texto)     # observ_admin
                 w.update_cell(i, 12, iso_now())
                 st.success("Observación guardada.")
@@ -346,7 +413,7 @@ def _admin_guardar_observacion(tid: int, texto: str, usuario_ctx: Dict):
 
 def _admin_editar_tarea(tid: int, titulo: str, desc: str, prior: str, asignado_nombre: str, fecha_limite: date, usuario_ctx: Dict):
     dfu = df_usuarios()
-    rowu = dfu[(dfu["nombre"]==asignado_nombre) & (dfu["rol_norm"]=="user")]
+    rowu = dfu[(dfu["nombre"]==asignado_nombre) & (dfu["rol_norm"]=="user") & (dfu["activo_norm"])]
     if rowu.empty:
         st.error("Usuario destino inválido o inactivo.")
         return
@@ -354,7 +421,7 @@ def _admin_editar_tarea(tid: int, titulo: str, desc: str, prior: str, asignado_n
     w = ws_tareas(); recs = w.get_all_records()
     for i, r in enumerate(recs, start=2):
         try:
-            if int(r.get("tarea_id", 0)) == int(tid):
+            if int(pd.to_numeric(r.get("tarea_id"), errors="coerce")) == int(tid):
                 w.update(f"A{i}:L{i}", [[
                     tid, titulo.strip(), desc.strip(), prior, r.get("estado","Nueva"),
                     str(asig["id"]), asig["nombre"], r.get("fecha_asignacion", iso_now()), str(fecha_limite),
@@ -371,7 +438,7 @@ def _admin_eliminar_tarea(tid: int, usuario_ctx: Dict):
     w = ws_tareas(); recs = w.get_all_records()
     for i, r in enumerate(recs, start=2):
         try:
-            if int(r.get("tarea_id", 0)) == int(tid):
+            if int(pd.to_numeric(r.get("tarea_id"), errors="coerce")) == int(tid):
                 w.delete_rows(i)
                 st.success("Tarea eliminada.")
                 log("tarea_eliminar", usuario_ctx["usuario"], f"{tid}")
@@ -401,15 +468,13 @@ def actualizar_resumen():
             except: pass
         wsr.append_row([uid, uname, tot, pen, val, rec, ult])
 
-def portada_inicial():
-    st.title(APP_TITLE)
-    st.divider()
-
 # ========= Main =========
 def main():
     seed_usuarios_si_vacio()
     mig = migrate_passwords_a_fijas()
     if mig: st.toast(f"{mig} contraseñas normalizadas.", icon="✅")
+    mig_ids = migrate_tarea_ids()
+    if mig_ids: st.toast(f"Normalicé {mig_ids} tarea(s) sin ID.", icon="🧩")
 
     portada()
 
@@ -418,13 +483,16 @@ def main():
     logout_btn()
     user = st.session_state["auth"]
 
-    vista = st.sidebar.radio("Secciones", ["Usuarios", "Tareas", "Resumen"])
+    vista = st.sidebar.radio("Secciones", ["Usuarios", "Tareas", "Resumen", "Mi Perfil"])
     if vista == "Usuarios":   view_usuarios()
     elif vista == "Tareas":   view_tareas(user)
-    else:                     st.dataframe(pd.DataFrame(ws_resumen().get_all_records()), use_container_width=True, hide_index=True)
+    elif vista == "Resumen":  st.dataframe(pd.DataFrame(ws_resumen().get_all_records()), use_container_width=True, hide_index=True)
+    else:                     view_perfil_admin(user)
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
